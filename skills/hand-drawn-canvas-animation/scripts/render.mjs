@@ -52,10 +52,13 @@ const browser = await puppeteer.launch({executablePath: findChrome(), headless: 
 let N, fps, size, hasAudio = false;
 try {
   const page = await browser.newPage(), errors = [];
-  page.on('pageerror', e => errors.push(String(e)));
+  let fail; const failed = new Promise((_, reject) => { fail = reject; }); failed.catch(() => {});
+  page.on('pageerror', e => { errors.push(String(e)); fail(new Error(`${file}: ${e.message || e}`)); });
   page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+  page.on('requestfailed', r => fail(new Error(`${file}: failed to load ${r.url()} (check script paths)`)));
   await page.goto(url.href, {waitUntil: 'load'});
-  await page.waitForFunction('window.__ready === true || window.__error', {timeout: 60000});
+  // Fail fast on a script error or a missing script instead of waiting out the timeout.
+  await Promise.race([failed, page.waitForFunction('window.__ready === true || window.__error', {timeout: 60000})]);
   const meta = await page.evaluate(() => ({N: window.__NDRAW, fps: window.__fps, size: window.__size, error: window.__error}));
   ({N, fps, size} = meta);
   if (meta.error || errors.length) throw new Error(meta.error || errors.join('\n'));
