@@ -81,8 +81,9 @@ function book3({ PW = 460, PD = 620, spreads, cover, board = '#27335c', edge = '
     return quads;
   }
   book.draw = (c, { turn }) => { const t = clamp(turn, 0, nS), k = Math.min(Math.floor(t + 1e-9), nS), fr = k >= nS ? 0 : t - k, yL = k * LEAF + 3, yR = (nS - k) * LEAF + 3, top = Math.max(yL, yR);
-    // boards, then the two blocks of leaves
-    { const QL = pageQuad('L', 0, 0, 10), QR = pageQuad('R', 0, 0, 10); if (k > 0 || fr > 0) quad3(c, boardSheet, QL, { n: 4, dark: shadeOf(QL) + .1 }); quad3(c, boardSheet, QR, { n: 4, dark: shadeOf(QR) + .1 }); }
+    // boards, then the two blocks of leaves. While the cover (leaf 0) is in the air it is the front board,
+    // so the left board only lies flat once the cover has landed there (a flat copy would pop at the end of the turn).
+    { const QL = pageQuad('L', 0, 0, 10), QR = pageQuad('R', 0, 0, 10); if (k > 0) quad3(c, boardSheet, QL, { n: 4, dark: shadeOf(QL) + .1 }); quad3(c, boardSheet, QR, { n: 4, dark: shadeOf(QR) + .1 }); }
     if (k > 0) block(c, 'L', yL); block(c, 'R', yR - (fr > 0 ? LEAF : 0));
     if (fr === 0) { if (k === 0) { const Q = pageQuad('R', 0, yR + 2, 8); quad3(c, cover, Q, { n: 12, dark: shadeOf(Q) }); return; }
       const sp = spreads[k - 1], QL = pageQuad('L', 0, yL), QR = pageQuad('R', 0, yR); quad3(c, sp.left, QL, { n: 12, dark: shadeOf(QL) }); quad3(c, sp.right, QR, { n: 12, dark: shadeOf(QR) });
