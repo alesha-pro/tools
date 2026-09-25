@@ -542,6 +542,13 @@ function defineFilm({ palette, timeline, score, format = {}, fps = 24 }) {
     else show(qs.has('frame') ? +qs.get('frame') : 0); window.__ready = true; };
   Promise.all([..._photoLoads, document.fonts.ready]).then(go).catch(e => { window.__error = String(e); console.error(e); });   // photos decode before the first frame
 }
+// downscale: halve repeatedly, then one final resize. A single large-ratio drawImage skips pixels,
+// so thin lines vanish from sheet thumbnails that are fine in the frame.
+function downscale(src, w, h) {
+  let cur = src, cw = src.width, ch = src.height;
+  while (cw / 2 >= w && ch / 2 >= h) { const n = document.createElement('canvas'); n.width = Math.max(1, Math.round(cw / 2)); n.height = Math.max(1, Math.round(ch / 2)); n.getContext('2d').drawImage(cur, 0, 0, n.width, n.height); cur = n; cw = n.width; ch = n.height; }
+  return cur;
+}
 // gridSheet: n evenly spaced drawn frames tiled 6 across, labelled with index and time. The first thing to look at.
 function gridSheet(n = 24, cellW = 240, startFrame = null) {
   if (!Number.isInteger(n) || n < 1 || n > 240) throw new Error('Sheet count must be 1..240');
@@ -549,7 +556,7 @@ function gridSheet(n = 24, cellW = 240, startFrame = null) {
   sheet.width = cols * cellW; sheet.height = rows * (cellH + pad); const g = sheet.getContext('2d'); g.fillStyle = '#141414'; g.fillRect(0, 0, sheet.width, sheet.height);
   g.font = '12px ui-monospace, Menlo, monospace'; g.fillStyle = '#e6e6e6';
   for (let k = 0; k < n; k++) { const i = startFrame === null ? Math.round(k * (FILM.NDRAW - 1) / Math.max(1, n - 1)) : clamp(startFrame + k, 0, FILM.NDRAW - 1); cur = -1; show(i);
-    const x = (k % cols) * cellW, y = Math.floor(k / cols) * (cellH + pad); g.drawImage(cv, x, y, cellW, cellH); g.fillText(`${String(i).padStart(3, '0')}  ${(i / FPS_DRAW).toFixed(2)}s`, x + 4, y + cellH + 13); }
+    const x = (k % cols) * cellW, y = Math.floor(k / cols) * (cellH + pad); g.drawImage(downscale(cv, cellW, cellH), x, y, cellW, cellH); g.fillText(`${String(i).padStart(3, '0')}  ${(i / FPS_DRAW).toFixed(2)}s`, x + 4, y + cellH + 13); }
   cur = -1; return sheet;
 }
 // locate: which scene frame i falls in, its tau (snapped to the 12 fps grid for a scene on twos) and the 12 fps frame index handed to the scene
