@@ -90,7 +90,8 @@ try {
  });
  await check('all examples load and support late/backward frame evaluation',async()=>{
   const results=[];
-  const examples=fs.readdirSync(path.join(root,'examples')).filter(f=>f.endsWith('.html'));
+  // Interactive pages (workshop.html) drive the engine without defineFilm and never set window.__ready.
+  const examples=fs.readdirSync(path.join(root,'examples')).filter(f=>f.endsWith('.html')&&fs.readFileSync(path.join(root,'examples',f),'utf8').includes('defineFilm('));
   examples.push('becoming-phoenix/phoenix.html');
   for(const file of examples){
    const {p,errors}=await load(path.join(root,'examples',file));
