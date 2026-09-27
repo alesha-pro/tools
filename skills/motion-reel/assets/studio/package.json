@@ -1,0 +1,1 @@
+{"name":"motion-reel-project","version":"1.0.0","private":true,"type":"module","scripts":{"render":"node render.mjs","test":"node test-motion.mjs"},"devDependencies":{"playwright":"1.58.2"}}

@@ -73,6 +73,11 @@ model is required.
 cp -r skills/hand-drawn-canvas-animation ~/.agents/skills/
 ```
 
+**[motion-reel](skills/motion-reel)** makes product films, showreels and UI morphs
+from a brief and visual references. It includes a Canvas renderer, spring motion,
+original music and SFX, beat analysis, contact sheets and MP4 checks. The skill
+covers planning, animation, review and export, with source files you can edit.
+
 More lands here as I clean it up.
 
 ---

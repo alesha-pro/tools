@@ -1,0 +1,32 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Motion Reel — engine sample</title>
+<style>html,body{margin:0;background:#151715}canvas{display:block}</style>
+<canvas id="c"></canvas>
+<script type="module">
+import {spring,clamp,loopT} from './motion.mjs';
+const q=new URLSearchParams(location.search),W=+(q.get('w')||1080),H=+(q.get('h')||1920),DUR=15;
+const c=document.querySelector('canvas');c.width=W;c.height=H;const g=c.getContext('2d',{willReadFrequently:true});
+const wide=W/H>1.3,cx=wide?W*.3:W/2,cy=wide?H*.5:H*.47,tx=wide?W*.76:W/2,ty=wide?H*.54:H*.76;
+const u=Math.min(W,H),ink='#ece9dc',accent='#e6ff57';
+window.ready=(async()=>{await document.fonts.ready;await Promise.all([...document.images].map(i=>i.decode()));})();
+function text(s,size,y,x=W/2){g.font=`800 ${size}px sans-serif`;g.textAlign='center';g.fillStyle=ink;g.fillText(s,x,y);}
+window.seek=t=>{
+  t=clamp(t,0,DUR-1e-7);g.resetTransform();g.globalAlpha=1;g.fillStyle='#151715';g.fillRect(0,0,W,H);
+  const shot=Math.floor(t/5),local=t%5;
+  if(shot===0){
+    const a=spring(local,100,20);g.fillStyle=accent;
+    g.save();g.translate(W/2,H*.46);g.rotate(-.4+a*.4);g.fillRect(-u*.32*a,-u*.17,u*.64*a,u*.34);g.restore();
+    g.fillStyle='#151715';g.font=`900 ${u*.14}px sans-serif`;g.textAlign='center';g.fillText('MAKE',W/2,H*.46+u*.05);
+    text('IT MOVE.',u*.115,H*.46+u*.34);
+  }else if(shot===1){
+    for(let i=0;i<20;i++){const a=spring(local-i*.035,180,20);g.save();g.translate(cx,cy);g.rotate(i*Math.PI/10+local*.22);g.fillStyle=i%3?ink:accent;g.fillRect(u*.12*a,-u*.016,u*.28*a,u*.032);g.restore();}
+    text('RHYTHM',u*.12,ty,tx);
+  }else{
+    const a=spring(local,100,20);g.strokeStyle=accent;g.lineWidth=u*.025;
+    for(let i=0;i<4;i++){g.beginPath();g.arc(cx,cy,u*(.12+i*.07)*a,0,Math.PI*2);g.stroke();}
+    text('IN CODE.',u*.12,ty,tx);
+  }
+  return true;
+};
+await window.ready;window.seek(0);
+if(!q.has('render')){const start=performance.now();function play(now){window.seek(loopT((now-start)/1000,DUR));requestAnimationFrame(play);}requestAnimationFrame(play);}
+</script></html>

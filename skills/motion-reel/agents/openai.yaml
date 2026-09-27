@@ -1,0 +1,4 @@
+interface:
+  display_name: "Motion Reel Studio"
+  short_description: "Motion-видео из кода: от референса до MP4"
+  default_prompt: "Используй $motion-reel: создай 15-секундный motion-ролик с музыкой, проверь кадры и отдай готовый MP4."
