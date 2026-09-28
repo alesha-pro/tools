@@ -1,0 +1,444 @@
+diff --git a/app/scripts/render.ts b/app/scripts/render.ts
+index 0c2b32d..e757e37 100644
+--- a/app/scripts/render.ts
++++ b/app/scripts/render.ts
+@@ -44,17 +44,23 @@ async function ensureServer(): Promise<{ url: string; stop: () => void }> {
+ }
+ 
+ async function openPage(url: string) {
++  // RENDER_CPU=1: software WebGL (SwiftShader), no GPU touched; CHROME_PATH picks a non-system Chrome (e.g. playwright's chromium on the rig)
++  const cpu = !!process.env.RENDER_CPU;
++  // RENDER_ANGLE=vulkan|gl-egl: GPU backend on Linux (default metal = macOS)
++  const angle = process.env.RENDER_ANGLE ?? 'metal';
++  const gl = cpu ? ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']
++    : ['--use-gl=angle', `--use-angle=${angle}`, '--enable-gpu-rasterization', ...(angle === 'vulkan' ? ['--enable-features=Vulkan'] : [])];
+   const browser = await chromium.launch({
+-    channel: 'chrome',
++    ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : { channel: 'chrome' }),
+     headless: !flag('headed'),
+-    args: ['--use-angle=metal', '--enable-gpu-rasterization', '--ignore-gpu-blocklist', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'],
++    args: [...gl, '--ignore-gpu-blocklist', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'],
+   });
+   const page = await browser.newPage({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1 });
+   const logs: string[] = [];
+   page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') logs.push(`[${m.type()}] ${m.text()}`); });
+   page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}`));
+   const only = opt('only');
+-  await page.goto(`${url}/?export=1${only ? `&only=${only}` : ''}${SCALE !== 1 ? `&scale=${SCALE}` : ''}`);
++  await page.goto(`${url}/?export=1${only ? `&only=${only}` : ''}${SCALE !== 1 ? `&scale=${SCALE}` : ''}${opt('lead') ? `&lead=${opt('lead')}` : ''}${opt('calm') ? `&calm=${opt('calm')}` : ''}`);
+   await page.waitForFunction(() => (window as any).__pdoom?.ready || (window as any).__pdoom?.error, null, { timeout: 120000 });
+   const err = await page.evaluate(() => (window as any).__pdoom.error);
+   if (err) throw new Error(`app failed to boot:\n${err}\n${logs.join('\n')}`);
+@@ -90,12 +96,13 @@ async function sheet(page: Page, times: number[], cols: number, out: string) {
+     const c = cv.getContext('2d')!;
+     c.fillStyle = '#222'; c.fillRect(0, 0, cv.width, cv.height);
+     const src = document.getElementById('c') as HTMLCanvasElement;
+-    times.forEach((t: number, i: number) => {
+-      P.still(t);
++    for (let i = 0; i < times.length; i++) {
++      const t = times[i]!;
++      await P.still(t);
+       const x = pad + (i % cols) * (cw + pad), y = pad + Math.floor(i / cols) * (ch + lab + pad);
+       c.drawImage(src, x, y + lab, cw, ch);
+       c.fillStyle = '#ddd'; c.font = '13px monospace'; c.fillText(`${t.toFixed(2)}s`, x + 2, y + 13);
+-    });
++    }
+     return cv.toDataURL('image/png');
+   }, { times, cols });
+   mkdirSync(path.dirname(out), { recursive: true });
+@@ -105,14 +112,16 @@ async function sheet(page: Page, times: number[], cols: number, out: string) {
+ async function video(page: Page, from: number, to: number, fps: number, out: string) {
+   mkdirSync(path.dirname(out), { recursive: true });
+   const crf = opt('crf', '16')!;
+-  const audio = path.join(ROOT, 'audio/pdoom.mp3');
++  const audio = path.join(ROOT, 'audio/track.wav');
+   const args = ['ffmpeg', '-y', '-loglevel', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${OW}x${OH}`, '-r', String(fps), '-i', 'pipe:0'];
+   if (!flag('noaudio')) args.push('-ss', String(from), '-t', String(to - from), '-i', audio);
+   // Frames are sRGB (toSRGB in the final pass): convert with the BT.709 matrix and tag the stream,
+   // otherwise ffmpeg converts with BT.601 while players and YouTube decode untagged HD as BT.709.
+   // scale tags the matrix and range; primaries and transfer need setparams (the -color_* output flags don't reach the stream).
+-  args.push('-vf', 'vflip,scale=out_color_matrix=bt709,setparams=color_primaries=bt709:color_trc=bt709', '-c:v', 'libx264', '-preset', opt('preset', 'slow')!, '-crf', crf, '-pix_fmt', 'yuv420p', '-tune', 'grain', '-x264-params', opt('x264', 'aq-mode=3')!);
+-  if (!flag('noaudio')) args.push('-c:a', 'aac', '-b:a', '320k', '-shortest');
++  // --tune none drops -tune grain (smaller files for drafts)
++  args.push('-vf', 'vflip,scale=out_color_matrix=bt709,setparams=color_primaries=bt709:color_trc=bt709', '-c:v', 'libx264', '-preset', opt('preset', 'slow')!, '-crf', crf, '-pix_fmt', 'yuv420p', ...(opt('tune', 'grain') === 'none' ? [] : ['-tune', opt('tune', 'grain')!]), '-x264-params', opt('x264', 'aq-mode=3')!);
++  // apad: the audio is padded with silence so an end card after the song is not cut by -shortest
++  if (!flag('noaudio')) args.push('-af', 'apad', '-c:a', 'aac', '-b:a', '320k', '-shortest');
+   args.push('-movflags', '+faststart', out);
+   const ff = Bun.spawn(args, { stdin: 'pipe', stdout: 'inherit', stderr: 'inherit' });
+   let frames = 0;
+diff --git a/app/src/engine/engine.ts b/app/src/engine/engine.ts
+index daedf65..800a948 100644
+--- a/app/src/engine/engine.ts
++++ b/app/src/engine/engine.ts
+@@ -5,6 +5,7 @@ import { AudioData } from './audio';
+ import { Lyrics } from './lyrics';
+ import { Compositor, FSPass, W, H, PW, PH, SCALE, SS_TAP, makeRT, clearRT } from './gl';
+ import { DEFAULT_POST, Post, SHOULDER_GLSL, type PostParams } from './post';
++import { CALM } from './util';
+ import { Hud, PDoom, type Caption } from './hud';
+ import type { Frame, Scene, SceneClass, SceneCtx, PostOverrides } from './scene';
+ import { loadFonts } from './type';
+@@ -176,7 +177,8 @@ export class Engine {
+     this.lastT = -1;
+   }
+ 
+-  get duration() { return this.audio.duration; }
++  /** The song, or longer when the timeline runs past it (an end card after the music). */
++  get duration() { return Math.max(this.audio.duration, ...this.timeline.map((e) => e.end)); }
+ 
+   private frameFor(e: TimelineEntry, t: number, dt: number, seeked: boolean, preroll: boolean, under: THREE.Texture | null, tin: number, tout: number): Frame {
+     const beat = this.audio.beatAt(t), bar = this.audio.barAt(t);
+@@ -266,6 +268,9 @@ export class Engine {
+       outTex = this.avgRT.texture;
+     }
+     this.lastSamples = n;
++    // global energy knob (?calm=): shake / zoom / colour split already come from CALM-scaled hits in the scenes;
++    // the post flash does not, so soften it here
++    if (CALM !== 1) post = { ...post, flash: post.flash * CALM };
+     const hudTex = this.hud.draw(t, { opacity: this.hudOff ? 0 : post.hud, frame: post.frame, readout: post.pdoom, paper: post.paper, pdoomOverride: post.pdoomText, corruption: post.hudCorruption });
+     this.post.render(r, outTex, hudTex, this.finalRT, post, t);
+     this.lastPost = post;
+@@ -296,6 +301,12 @@ export class Engine {
+     return m;
+   }
+ 
++  /** Let every scene overlapping [t0, t1] preload what it needs (see Scene.prepare). */
++  async prepare(t0: number, t1: number): Promise<void> {
++    const on = this.timeline.filter((e) => e.end > t0 && e.start <= t1);
++    await Promise.all(on.map((e) => this.loaded.get(e.id)?.scene?.prepare?.(t0, t1)));
++  }
++
+   /**
+    * Render and composite all scenes active at t into an HDR texture (no post). `dt` is the step handed to
+    * scenes (the frame step, or the sub-frame spacing); `seeked` says time jumped before this call.
+diff --git a/app/src/engine/glsl/common.ts b/app/src/engine/glsl/common.ts
+index 015403a..753e47f 100644
+--- a/app/src/engine/glsl/common.ts
++++ b/app/src/engine/glsl/common.ts
+@@ -24,6 +24,14 @@ const vec3 C_SIGNAL = ${v3(LIN.signal)};
+ const vec3 C_EMBER = ${v3(LIN.ember)};
+ const vec3 C_BLOOD = ${v3(LIN.blood)};
+ const vec3 C_ACID = ${v3(LIN.acid)};
++const vec3 C_PAPER = ${v3(LIN.paper)};
++const vec3 C_LINE = ${v3(LIN.line)};
++const vec3 C_PINK = ${v3(LIN.pink)};
++const vec3 C_COBALT = ${v3(LIN.cobalt)};
++const vec3 C_LEMON = ${v3(LIN.lemon)};
++const vec3 C_MINT = ${v3(LIN.mint)};
++const vec3 C_TANGERINE = ${v3(LIN.tangerine)};
++const vec3 C_LILAC = ${v3(LIN.lilac)};
+ 
+ /** Rotated-grid supersample offset k (0..3) within one pixel, in pixels. See SS_TAP (gl.ts). */
+ vec2 rgss(int k) { return k == 0 ? vec2(0.125, -0.375) : k == 1 ? vec2(0.375, 0.125) : k == 2 ? vec2(-0.125, 0.375) : vec2(-0.375, -0.125); }
+diff --git a/app/src/engine/hud.ts b/app/src/engine/hud.ts
+index 5a3cc71..8cdd85f 100644
+--- a/app/src/engine/hud.ts
++++ b/app/src/engine/hud.ts
+@@ -86,18 +86,24 @@ export interface HudState {
+ export class Hud {
+   layer = new Layer2D();
+   private ink = false;
++  /** App overlay drawn on every frame above everything (e.g. a watermark), independent of the HUD opacity. */
++  overlay?: (c: CanvasRenderingContext2D, t: number) => void;
+   constructor(public pdoom: PDoom, public captions: Caption[]) {}
+ 
+   draw(t: number, st: HudState) {
+     const L = this.layer;
+     L.clear();
+     const c = L.ctx;
+-    if (st.opacity <= 0.001) return L.upload();
+-    c.globalAlpha = st.opacity;
+-    this.ink = st.paper > 0.5;
+-    if (st.frame > 0.001) this.cropMarks(c, st.frame);
+-    if (st.readout > 0.001) { c.save(); c.globalAlpha *= st.readout; this.readout(c, t, st); c.restore(); }
+-    this.caption(c, t);
++    if (st.opacity > 0.001) {
++      c.save();
++      c.globalAlpha = st.opacity;
++      this.ink = st.paper > 0.5;
++      if (st.frame > 0.001) this.cropMarks(c, st.frame);
++      if (st.readout > 0.001) { c.save(); c.globalAlpha *= st.readout; this.readout(c, t, st); c.restore(); }
++      this.caption(c, t);
++      c.restore();
++    }
++    if (this.overlay) { c.save(); this.overlay(c, t); c.restore(); }
+     return L.upload();
+   }
+ 
+diff --git a/app/src/engine/lyrics.ts b/app/src/engine/lyrics.ts
+index 5d556d9..e982ea6 100644
+--- a/app/src/engine/lyrics.ts
++++ b/app/src/engine/lyrics.ts
+@@ -20,6 +20,17 @@ export interface Line {
+   words: Word[];
+ }
+ 
++/**
++ * Visual lead (s): every lyric time is shifted this much EARLIER for display. The aligned
++ * times are the acoustic word onsets; a word that lights up exactly on its onset reads as
++ * late (the eye registers a flash later than the ear a syllable), so karaoke leads the voice.
++ * Override in the preview with ?lead=0.05.
++ */
++export const LYRIC_LEAD = (() => {
++  const q = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('lead') : null;
++  return q !== null && q !== '' && isFinite(+q) ? +q : 0.13;
++})();
++
+ export class Lyrics {
+   lines: Line[];
+   words: Word[];
+@@ -30,7 +41,13 @@ export class Lyrics {
+       ...l,
+       i: li,
+       text: smart(l.text),
+-      words: (l.words as any[]).map((w, wi) => ({ ...w, w: smart(w.w), line: li, index: wi, gi: 0 })),
++      start: l.start - LYRIC_LEAD,
++      end: l.end - LYRIC_LEAD,
++      words: (l.words as any[]).map((w, wi) => ({
++        ...w, w: smart(w.w), line: li, index: wi, gi: 0,
++        start: w.start - LYRIC_LEAD, end: w.end - LYRIC_LEAD,
++        ...(w.syl ? { syl: (w.syl as [number, number][]).map(([a, b]) => [a - LYRIC_LEAD, b - LYRIC_LEAD]) } : {}),
++      })),
+     }));
+     this.words = this.lines.flatMap((l) => l.words);
+     this.words.forEach((w, i) => (w.gi = i));
+diff --git a/app/src/engine/palette.ts b/app/src/engine/palette.ts
+index fb70121..d6f55a1 100644
+--- a/app/src/engine/palette.ts
++++ b/app/src/engine/palette.ts
+@@ -12,6 +12,15 @@ export const HEX = {
+   ember: '#FF8A3D', // hotter, lighter orange for cores/highlights
+   blood: '#C21D0B', // deep red-orange for shadows of signal
+   acid: '#D8FF3C', // acid: only for the shrooms moment
++  // ---- Pink Boots, Export Doors: the white page ----
++  paper: '#FFFFFF', // the page: stays pure white
++  line: '#15131A', // drawing line / body text
++  pink: '#FF2E93', // her colour: boots, the sung word
++  cobalt: '#2440FF', // the state / "your bot"
++  lemon: '#FFE21A',
++  mint: '#2EE6A8',
++  tangerine: '#FF7A1A', // rare
++  lilac: '#B79CFF', // holo stop
+ } as const;
+ 
+ export type PaletteKey = keyof typeof HEX;
+diff --git a/app/src/engine/post.ts b/app/src/engine/post.ts
+index e3f155b..29b7e2b 100644
+--- a/app/src/engine/post.ts
++++ b/app/src/engine/post.ts
+@@ -6,9 +6,10 @@ import { FSPass, makeRT, W, H, SCALE } from './gl';
+ /** The tone shoulder (linear HDR -> 0..1 linear), shared with the engine's sampling error estimate. */
+ export const SHOULDER_GLSL = /* glsl */ `
+ vec3 shoulder(vec3 x) {
+-  // identity below k, smooth exponential shoulder above; very bright values desaturate toward white
+-  const float k = 0.72;
+-  vec3 y = mix(x, k + (1.0 - k) * (1.0 - exp(-(x - k) / (1.0 - k))), step(k, x));
++  // identity below k, smooth exponential shoulder above; very bright values desaturate toward white.
++  // White page: k = 1 so paper white (1.0) stays pure white; only HDR highlights (> 1) are compressed.
++  const float k = 1.0;
++  vec3 y = mix(x, k + 0.25 * (1.0 - exp(-(x - k) / 0.25)), step(k, x));
+   float over = max(max(x.r, x.g), x.b);
+   return mix(y, vec3(1.0), smoothstep(2.0, 12.0, over) * 0.85);
+ }`;
+@@ -42,16 +43,17 @@ export interface PostParams {
+ }
+ 
+ export const DEFAULT_POST: PostParams = {
++  // white page: no bloom/halation/vignette (they grey the paper), a whisper of grain
+   exposure: 1,
+-  bloom: 0.55,
+-  bloomThreshold: 0.85,
+-  bloomKnee: 0.5,
+-  bloomRadius: 0.75,
+-  halation: 0.25,
+-  ca: 1.2,
+-  grain: 0.055,
+-  vignette: 0.35,
+-  hud: 1,
++  bloom: 0,
++  bloomThreshold: 1.2,
++  bloomKnee: 0.4,
++  bloomRadius: 0.6,
++  halation: 0,
++  ca: 0,
++  grain: 0.018,
++  vignette: 0,
++  hud: 0,
+   frame: 0,
+   pdoom: 0,
+   paper: 0,
+@@ -145,7 +147,7 @@ ${SCALE === 1 ? `        c += texture(src, vUv + texel * vec2(-1, -1)).rgb; c +=
+         col = mix(col, h.rgb / max(h.a, 1e-4), h.a * hud);
+         col = shoulder(col);
+         col = mix(col, vec3(0.8515) - col * 0.84, invert); // ink<->bone in linear-ish space
+-        col += C_BONE * flash;
++        col = mix(col, C_PAPER, sat(flash));
+         // vignette
+         float v = smoothstep(0.95, 0.25, length(dc * vec2(1.0, 0.8)));
+         col *= mix(1.0, v, vignette);
+@@ -206,7 +208,7 @@ ${SCALE === 1 ? `        float g1 = hash12(gl_FragCoord.xy + fract(time * 13.37)
+     f.ca!.value = p.ca;
+     f.grain!.value = p.grain;
+     f.vignette!.value = p.vignette;
+-    f.hud!.value = p.hud;
++    f.hud!.value = 1; // HUD opacity is applied inside the HUD layer (Hud.draw), the overlay always shows
+     f.fade!.value = p.fade;
+     f.flash!.value = p.flash;
+     f.time!.value = time;
+diff --git a/app/src/engine/scene.ts b/app/src/engine/scene.ts
+index 8ebd18f..d4e8cd8 100644
+--- a/app/src/engine/scene.ts
++++ b/app/src/engine/scene.ts
+@@ -70,6 +70,13 @@ export abstract class Scene {
+   /** Load/create resources. Called once before first render. */
+   init(): Promise<void> | void {}
+ 
++  /**
++   * Optional async preload for the time range [t0, t1] (e.g. decode the video frames a shot needs).
++   * Export awaits it before every frame; the preview calls it ahead of the playhead without waiting,
++   * so render() must draw something sensible when the data is not there yet.
++   */
++  prepare?(t0: number, t1: number): Promise<void> | void;
++
+   /** Reset internal state (called on seeks for stateful scenes). */
+   reset(): void {}
+ 
+diff --git a/app/src/engine/type.ts b/app/src/engine/type.ts
+index a74cc32..48fbe27 100644
+--- a/app/src/engine/type.ts
++++ b/app/src/engine/type.ts
+@@ -10,7 +10,7 @@ export const ARCHIVO_WIDTHS = [620, 750, 875, 1000, 1125, 1250] as const;
+ export const ARCHIVO_WEIGHTS = [300, 500, 700, 900] as const;
+ 
+ /** `features`: OpenType features switched on for the face (Canvas2D has no font-feature-settings). */
+-type FontDef = { family: string; file: string; features?: string };
++type FontDef = { family: string; file: string; features?: string; weight?: string };
+ const DEFS: FontDef[] = [];
+ for (const w of ARCHIVO_WIDTHS) for (const wt of ARCHIVO_WEIGHTS) DEFS.push({ family: `Archivo-${w}-${wt}`, file: `Archivo-w${w}-${wt}.ttf` });
+ for (const w of [750, 1000]) for (const wt of [400, 800]) DEFS.push({ family: `ArchivoItalic-${w}-${wt}`, file: `ArchivoItalic-w${w}-${wt}.ttf` });
+@@ -22,9 +22,27 @@ for (const wt of [400, 600]) {
+ for (const [n, f] of [['300', 'Light'], ['400', 'Regular'], ['500', 'Medium'], ['600', 'SemiBold'], ['700', 'Bold']] as const)
+   DEFS.push({ family: `Plex-${n}`, file: `src/IBMPlexMono-${f}.ttf` });
+ DEFS.push({ family: 'PlexItalic-400', file: 'src/IBMPlexMono-Italic.ttf' });
++// Pink Boots: Bricolage Grotesque (display, static instances at opsz 96) + Instrument Serif
++for (const wd of [75, 100]) for (const wt of [500, 800]) DEFS.push({ family: `Bricolage-${wd}-${wt}`, file: `pop/Bricolage-w${wd}-${wt}.ttf` });
++DEFS.push({ family: 'InstrumentSerif', file: 'pop/InstrumentSerif-Regular.ttf' });
++DEFS.push({ family: 'InstrumentSerifItalic', file: 'pop/InstrumentSerif-Italic.ttf' });
++// world kits (phone / scrapbook / comic): OFL + Apache Google Fonts
++for (const [family, file] of [['Bangers', 'Bangers-Regular'], ['ComicNeue', 'ComicNeue-Bold'], ['GochiHand', 'GochiHand-Regular'],
++  ['LuckiestGuy', 'LuckiestGuy-Regular'], ['PermanentMarker', 'PermanentMarker-Regular'], ['RubikBubbles', 'RubikBubbles-Regular']] as const)
++  DEFS.push({ family, file: `kit/${file}.ttf` });
++DEFS.push({ family: 'Caveat', file: 'kit/Caveat.ttf', weight: '400 700' });
++DEFS.push({ family: 'Inter', file: 'kit/Inter.ttf', weight: '100 900' });
+ 
+ /** Convenience family names. */
+ export const F = {
++  /** Bricolage Grotesque: condensed (75) or normal (100) width, 500 or 800 weight. */
++  pop(width = 100, weight = 800): string {
++    return `Bricolage-${width < 88 ? 75 : 100}-${weight < 650 ? 500 : 800}`;
++  },
++  /** Instrument Serif (italic by default): the sweet aside. */
++  sweet(italic = true): string {
++    return italic ? 'InstrumentSerifItalic' : 'InstrumentSerif';
++  },
+   /** Archivo at nearest available width/weight. width in [62..125] (percent), weight 300..900 */
+   archivo(width = 100, weight = 700): string {
+     const w = nearest(ARCHIVO_WIDTHS as unknown as number[], width * 10);
+@@ -51,6 +69,8 @@ function nearest(list: number[], v: number) {
+ 
+ /** CSS font string for Canvas2D. */
+ export const font = (family: string, sizePx: number) => `${sizePx}px "${family}"`;
++/** CSS font string with an explicit weight (for the variable faces: Inter, Caveat). */
++export const fontW = (family: string, sizePx: number, weight: number) => `${weight} ${sizePx}px "${family}"`;
+ 
+ const otCache = new Map<string, opentype.Font>();
+ const bufCache = new Map<string, ArrayBuffer>();
+@@ -60,7 +80,10 @@ export async function loadFonts(): Promise<void> {
+     DEFS.map(async (d) => {
+       const buf = await (await fetch(`fonts/${d.file}`)).arrayBuffer();
+       bufCache.set(d.family, buf);
+-      const ff = new FontFace(d.family, buf, d.features ? { featureSettings: d.features } : undefined);
++      const desc: FontFaceDescriptors = {};
++      if (d.features) desc.featureSettings = d.features;
++      if (d.weight) desc.weight = d.weight;
++      const ff = new FontFace(d.family, buf, desc);
+       await ff.load();
+       document.fonts.add(ff);
+     }),
+diff --git a/app/src/engine/util.ts b/app/src/engine/util.ts
+index c403d73..58aa429 100644
+--- a/app/src/engine/util.ts
++++ b/app/src/engine/util.ts
+@@ -171,3 +171,12 @@ export function hexToLinear(hex: string): [number, number, number] {
+   });
+   return c as [number, number, number];
+ }
++
++/**
++ * Global energy knob (?calm=0.65): scales the punches (beat/word/downbeat hits, decays), spring overshoot,
++ * whip roll, cut flashes and the post punch (shake, zoom, colour split). 1 = the full cut.
++ */
++export const CALM = (() => {
++  const q = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('calm') : null;
++  return q !== null && q !== '' && isFinite(+q) ? Math.max(0, +q) : 1;
++})();
+diff --git a/app/src/main.ts b/app/src/main.ts
+index 010d21f..3d29806 100644
+--- a/app/src/main.ts
++++ b/app/src/main.ts
+@@ -2,6 +2,8 @@
+ import { Engine, type AdaptiveSampling } from './engine/engine';
+ import { PW, PH, SCALE } from './engine/gl';
+ import { makeTimeline } from './timeline';
++import { watermark } from './lib/brand';
++import { W } from './engine/gl';
+ 
+ const params = new URLSearchParams(location.search);
+ const EXPORT = params.has('export');
+@@ -24,6 +26,8 @@ let TIMELINE: typeof engine.timeline = [];
+ async function boot() {
+   const onlySet = ONLY ? new Set(ONLY.split(',')) : null;
+   await engine.init(onlySet ? (e) => onlySet.has(e.id) : undefined);
++  // author watermark, top-right, while the song plays (the end card shows the handles itself)
++  engine.hud.overlay = (c, t) => { if (t < engine.audio.duration) watermark(c, W); };
+   TIMELINE = engine.timeline;
+   if (EXPORT) setupExport();
+   else setupPlayer();
+@@ -42,7 +46,7 @@ function setupExport() {
+     height: PH,
+     timeline: TIMELINE.map(({ id, start, end }) => ({ id, start, end })),
+     /** Render a single frame at t (seeks as needed). */
+-    still(t: number, samples: number | AdaptiveSampling = 1, shutter = 0.5) { return engine.render(t, 1 / 60, true, samples, shutter); },
++    async still(t: number, samples: number | AdaptiveSampling = 1, shutter = 0.5) { await engine.prepare(t - 1 / 60, t + 1 / 60); return engine.render(t, 1 / 60, true, samples, shutter); },
+     /** The last rendered frame as a full-resolution (PW x PH) PNG, base64 (for stills at scale > 1). */
+     async png() {
+       const px = await engine.readPixelsAsync(), row = PW * 4;
+@@ -74,9 +78,10 @@ function setupExport() {
+       // warm-up: render one frame before the range so the first frame is sequential for stateful scenes
+       const S = opts.samples ?? 1, SH = opts.shutter ?? 0.5;
+       // (adaptive sampling only runs stateless scenes: one sample is enough for the warm-up)
+-      if (n0 > 0) engine.render((n0 - 1) * dt, dt, false, typeof S === 'number' ? S : 1, SH);
++      if (n0 > 0) { await engine.prepare((n0 - 2) * dt, n0 * dt); engine.render((n0 - 1) * dt, dt, false, typeof S === 'number' ? S : 1, SH); }
+       const used: Record<number, number> = {}; // sub-frames per frame -> frames
+       for (let n = n0; n < n1; n++) {
++        await engine.prepare((n - 1) * dt, (n + 1) * dt);
+         const k = engine.render(n * dt, dt, false, S, SH);
+         used[k] = (used[k] ?? 0) + 1;
+         await engine.readPixelsAsync(buf);
+@@ -95,7 +100,7 @@ function setupExport() {
+ 
+ // ------------------------------------------------------------------ preview player
+ function setupPlayer() {
+-  const audio = new Audio('audio/pdoom.mp3');
++  const audio = new Audio('audio/track.wav');
+   audio.preload = 'auto';
+   const ui = document.getElementById('ui')!;
+   const scrub = document.getElementById('scrub') as HTMLInputElement;
+@@ -152,6 +157,7 @@ function setupPlayer() {
+       if (loop && t >= loop[1]) seek(loop[0]);
+       if (audio.ended) playing = false;
+     }
++    void engine.prepare(t, t + 0.6);
+     engine.render(t, 1 / 60);
+     scrub.value = String(t);
+     frames++;

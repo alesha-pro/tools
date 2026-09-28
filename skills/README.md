@@ -8,6 +8,7 @@ scripts and references that file points to.
 |---|---|
 | [`hand-drawn-canvas-animation`](hand-drawn-canvas-animation) | drawn films in JavaScript and Canvas 2D, with authored poses, five material styles, sand, paper unfolding and a complete 60-second phoenix example. Includes an MP4 renderer, original sound and browser checks |
 | [`motion-reel`](motion-reel) | product films, showreels and UI morphs with a Canvas renderer, spring motion, music/SFX, frame review and MP4 validation |
+| [`lyric-music-video`](lyric-music-video) | code-rendered lyric music videos for a finished song: intake interview, styleframes, word and beat alignment, a deterministic three.js + Canvas engine (patch for pdoom-video), a character from generated stills, parallel section agents, contact-sheet QA, chunked renders on a local or remote GPU, variants, watermark and end card |
 
 Install one by copying its folder into `~/.agents/skills/`, or into
 `.agents/skills/` inside a project.

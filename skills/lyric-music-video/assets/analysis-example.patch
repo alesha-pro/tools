@@ -1,0 +1,318 @@
+diff --git a/analysis/align.py b/analysis/align.py
+index e2e7a07..e4207e1 100644
+--- a/analysis/align.py
++++ b/analysis/align.py
+@@ -28,7 +28,7 @@ from pron import pron
+ # mono sum, left and right channel (choruses are double-tracked L/R).
+ PRIMARY = "fused6"
+ # Independent-ish alternatives, used for agreement-based confidence.
+-ALTS = ("mms", "lv60k", "fused_vocL", "fused_vocR", "fused_lead")
++ALTS = ("mms", "lv60k", "fused_vocL", "fused_vocR")
+ 
+ # Per-line time windows (seconds) where the automatic path is ambiguous.
+ LINE_WINDOWS = {}
+@@ -43,39 +43,36 @@ ANCHORS = {}
+ # plots clearly show the automatic result is wrong.  (line, token) ->
+ # dict(start=..., end=...)
+ FIX = {
+-    # L5 "don't eat me alive": long legato vowels, CTC places eat/alive late /
+-    # early.  /i:/ of "eat" starts right after the t-release at 20.26; "alive"
+-    # starts with the pitch drop to the schwa at 21.35 ("-live" at 21.85).
+-    (5, 3): dict(start=20.27),
+-    (5, 5): dict(start=21.35),
+-    # L11 "shinigami eyes": shi-ni-ga-mi then /a/ of "eyes" at 34.73
+-    (11, 3): dict(start=34.73),
+-    # L40 final chorus "I'm upping my P(doom)": lead is buried under a
+-    # sustained backing "ah" pad (122.8-125.8); CTC finds nothing.  Placed from
+-    # the median-filtered spectrogram + karaoke-lead stem ("doom" /d/ at
+-    # 125.66 seen by both CTC models on the lead stem), rhythm identical to
+-    # chorus 3 (95.46 / 95.70 / 96.10 / 96.32).
+-    (40, 3): dict(start=125.40, syl=[125.66], conf=0.45),
+-    (40, 0): dict(start=124.52, conf=0.35),
+-    (40, 1): dict(start=124.78, conf=0.35),
+-    (40, 2): dict(start=125.20, conf=0.4),
+-    # Chorus pickups "I'm": strong vocal onset 2.5 beats before the DOOM
+-    # downbeat in every chorus (the CTC path smears "I'm" over backing vocals).
+-    (6, 0): dict(start=22.76, conf=0.7),
+-    (17, 0): dict(start=59.13, conf=0.7),
+-    (17, 1): dict(start=59.36),
+-    (28, 0): dict(start=95.47, conf=0.75),
+-    # "lies," voiced /l/ onset (lv60k / L / R channels agree, onset peak 31.16)
+-    (10, 4): dict(start=31.14, conf=0.7),
+-    # "We" / "don't": rest-onset rule fired on reverb tail / breath noise.
+-    (12, 0): dict(start=38.62),
+-    (27, 2): dict(start=92.46),
+-    # "you are" is one long note; vowel change /u/ -> /a/ (spectral centroid
+-    # 1020 -> 1180 Hz) at 83.93.  CTC models disagree (83.94 mms / 84.58 lv).
+-    (25, 6): dict(start=83.93, conf=0.5),
+-    # held notes whose automatic end ran into the next (unlisted) vocal
+-    (33, 2): dict(end=108.45),
+-    (45, 4): dict(end=140.55),
++    # Choruses are near-identical copies (word positions in bars agree to ~0.02 bar
++    # across the 3 choruses). Outliers are replaced by the consensus position,
++    # converted with the downbeat grid (data/audio.json). 'Oh my, oh my, A-I':
++    # Oh on beat 4, my on 1, oh on 2.5, my on 3, A on 4, I on the next downbeat
++    # (Whisper + vocal onsets agree in all three choruses).
++    (11, 0): dict(start=49.9),
++    (11, 5): dict(start=52.605),
++    (12, 0): dict(start=53.494),
++    (12, 1): dict(start=53.886),
++    (12, 2): dict(start=54.578),
++    (12, 3): dict(start=54.773),
++    (12, 4): dict(start=55.288, syl=[55.732]),
++    (14, 4): dict(start=61.857),
++    (15, 1): dict(start=64.382),
++    (15, 2): dict(start=65.004),
++    (28, 0): dict(start=111.877),
++    (28, 1): dict(start=112.265),
++    (28, 2): dict(start=112.953),
++    (28, 3): dict(start=113.147),
++    (28, 4): dict(start=113.659, syl=[114.1]),
++    (30, 2): dict(start=118.932),
++    (30, 3): dict(start=119.032),
++    (30, 5): dict(start=120.456),
++    (30, 7): dict(start=121.149),
++    (40, 0): dict(start=155.651),
++    (40, 1): dict(start=156.034),
++    (40, 2): dict(start=156.716),
++    (40, 3): dict(start=156.909),
++    (40, 4): dict(start=157.416, syl=[157.853]),
++    (43, 4): dict(start=168.039),
+ }
+ 
+ # ---------------------------------------------------------------------------
+@@ -240,14 +237,7 @@ def refine(words, f, fix=None):
+     return words
+ 
+ 
+-EXTRA_DESC = [
+-    # (t0, t1, description) -- identified from QA plots, the karaoke lead stem
+-    # and Whisper / greedy CTC transcripts of the vocal stem.
+-    (34.9, 38.3, "backing-vocal tail / 'ah' ad-lib after 'eyes' over the break (chorus 1 end)"),
+-    (108.5, 110.15, "lead-in before 'Just transformers': Whisper hears a stuttered 'Just, just, just' (low confidence)"),
+-    (122.4, 125.9, "sustained backing 'ah' pad under 'I'm upping my P(doom)' (final chorus) - lead is buried here"),
+-    (140.6, 153.5, "outro chant: repeated 'oh' / 'oh-oh' vocal hook (Whisper: 'Oh, oh, oh...') until the drums stop at ~153"),
+-]
++EXTRA_DESC = []
+ 
+ 
+ def detect_extras(words, f):
+diff --git a/analysis/analyze.py b/analysis/analyze.py
+index cafd517..609e6d8 100644
+--- a/analysis/analyze.py
++++ b/analysis/analyze.py
+@@ -30,21 +30,21 @@ FPS = 100
+ # case the pickup stays in the previous section.  The choruses all start with
+ # a ~3-beat pickup "I'm upping my P-" over a bass stop, landing "DOOM" on the
+ # next downbeat, so the chorus section starts at the pickup bar.
++BAR_PHASE = 3  # beat index of the first downbeat (mod 4)
+ SECTION_BARS = [
+-    ("intro", None, 1),      # 0 .. bar 1 (1-bar synth intro, pickup "I" at 1.41)
+-    ("verse1", 1, 9),        # Eb Bb Cm Ab x1 (2 bars each), no drums until bar 7
+-    ("pre1", 9, 12),         # F F Ab  "ChatGPT, please don't eat me alive"
+-    ("chorus1", 12, 20),     # pickup/stop bar 12, "DOOM" on bar 13
+-    ("break1", 20, 21),      # 1-bar turnaround (tail of held "eyes")
+-    ("verse2", 21, 29),
+-    ("pre2", 29, 32),        # "Sydney, please let me free" (bass out)
+-    ("chorus2", 32, 41),     # incl. bar 40 (held "reckoned", pickup "Forward")
+-    ("verse3", 41, 49),
+-    ("pre3", 49, 52),        # breakdown: drums + bass out, "Gato, please don't let me go"
+-    ("chorus3", 52, 60),     # quiet chorus: light drums, no bass
+-    ("bridge", 60, 68),      # "Just transformers ..." (full band from bar 61)
+-    ("chorus4", 68, 77),     # final chorus, bar 76 = stop bar ("all for show?")
+-    ("outro", 77, None),     # full band + "oh" vocals to bar 84 (152.98), then decay
++    ("intro", None, 1),        # 1 bar synth, pickup "B-three" at bar 0.83
++    ("verse1", 1, 17),         # drums from bar 9, bass from bar 12
++    ("pre1", 17, 21),          # lighter drums; bar 20 = stop bar, pickup "My" at 20.7
++    ("chorus1", 21, 38),       # full band; bar 37 = break, pickup "DeepSeek"
++    ("verse2", 38, 50),
++    ("pre2", 50, 54),          # full band
++    ("chorus2_soft", 54, 62),  # first half stripped: light drums, no bass
++    ("chorus2", 62, 70),       # full from "Oh my, oh my, A-I"
++    ("bridge", 70, 77),        # light drums, no bass
++    ("build", 77, 79),         # 2-bar drum build
++    ("chorus3_soft", 79, 86),  # stripped again
++    ("chorus3", 86, 95),       # maximal: loudest bass of the song
++    ("outro", 95, None),       # near silence, spoken line at bar 95.2; last hit bar 100
+ ]
+ 
+ 
+@@ -237,6 +237,57 @@ def vocal_onsets(v, sr):
+ 
+ 
+ # ---------------------------------------------------------------------------
++
++def track_beats(drums, mix, sr, duration, bpm0=133.0):
++    """Variable-tempo beat grid (Suno tracks drift: here ~133 -> 137.7 BPM).
++    Phase-locked loop on a drum+mix onset envelope: each beat is searched near
++    its prediction (Gaussian prior, sd 25 ms), the period follows slowly; then
++    beat times are smoothed (local quadratic fit over +-8 beats) so the grid is
++    free of per-beat jitter but follows the tempo curve."""
++    from scipy.signal import savgol_filter
++    hop = 64
++    od = librosa.onset.onset_strength(y=librosa.resample(drums, orig_sr=sr, target_sr=22050),
++                                      sr=22050, hop_length=hop // 2, lag=1, max_size=1)
++    om = librosa.onset.onset_strength(y=librosa.resample(mix, orig_sr=sr, target_sr=22050),
++                                      sr=22050, hop_length=hop // 2, lag=1, max_size=1)
++    o = od / (np.percentile(od, 99) + 1e-9) + 0.5 * om / (np.percentile(om, 99) + 1e-9)
++    ofps = 22050 / (hop // 2)
++    P = 60 / bpm0
++    # initial phase: best offset over the first 12 s at bpm0
++    best = (-1, 0.0)
++    for off in np.arange(0, P, 0.002):
++        idx = (np.arange(off, 12, P) * ofps).astype(int)
++        sc = o[idx].mean()
++        if sc > best[0]:
++            best = (sc, off)
++    beats = [best[1]]
++    while beats[-1] + P < duration - 0.05:
++        pred = beats[-1] + P
++        a, b = int((pred - 0.07) * ofps), int((pred + 0.07) * ofps)
++        tt = np.arange(a, b) / ofps
++        w = o[a:b] * np.exp(-0.5 * ((tt - pred) / 0.025) ** 2)
++        if w.max() > 0.15 * np.percentile(o, 95):
++            t = float(tt[np.argmax(w)])
++            P = 0.92 * P + 0.08 * (t - beats[-1])
++        else:
++            t = pred
++        beats.append(t)
++    beats = np.array(beats)
++    idx = np.arange(len(beats))
++    sm = savgol_filter(beats, 17, 2)
++    # phase: the envelope locks onto whichever 8th-note grid is strongest (the
++    # off-beat hats here). Re-phase on kick attacks: shift every beat by the
++    # median kick phase (fraction of the local inter-beat interval).
++    kick_t, _ = band_onsets(drums, sr, None, 120, win=0.012, min_gap=0.2, rel_db=12)
++    ib = np.interp(kick_t, sm, np.arange(len(sm)))
++    ok = (ib > 0) & (ib < len(sm) - 1)
++    ph = np.angle(np.mean(np.exp(2j * np.pi * ib[ok]))) / (2 * np.pi)   # circular mean, -0.5..0.5
++    ibi = np.gradient(sm)
++    sm = sm + ph * ibi
++    print(f"kick phase shift {ph:+.3f} beat")
++    return sm
++
++
+ def main(plots=False):
+     mix, _ = common.load_mix(SR)
+     duration = len(mix) / SR
+@@ -245,13 +296,13 @@ def main(plots=False):
+         if len(stems[n]) < len(mix):
+             stems[n] = np.pad(stems[n], (0, len(mix) - len(stems[n])))
+ 
+-    bpm, P, off, kick_res = fit_grid(stems["drums"], mix, SR, duration)
+-    print(f"tempo {bpm:.3f} BPM  period {P:.5f}s  first beat {off:.4f}s  kick residual sd {kick_res.std()*1000:.1f} ms")
+-    beats = off + P * np.arange(int((duration - off) / P) + 1)
+-    # bar phase: beat index 0 is a downbeat (see NOTES / qa/drums_pattern.png)
+-    beat_in_bar = np.arange(len(beats)) % 4
++    beats = track_beats(stems["drums"], mix, SR, duration)
++    ibi = np.diff(beats)
++    P = float(np.median(ibi)); off = float(beats[0]); bpm = 60 / P
++    print(f"tempo {60/ibi[:32].mean():.2f} -> {60/ibi[-32:].mean():.2f} BPM, median {bpm:.2f}, first beat {off:.3f}")
++    beat_in_bar = (np.arange(len(beats)) - BAR_PHASE) % 4
+     downbeats = beats[beat_in_bar == 0]
+-    bar_t = lambda k: float(off + 4 * P * k)
++    bar_t = lambda k: float(downbeats[min(k, len(downbeats) - 1)])
+ 
+     # envelopes -------------------------------------------------------------
+     n = int(math.ceil(duration * FPS))
+diff --git a/analysis/common.py b/analysis/common.py
+index 9d6f1c8..a591219 100644
+--- a/analysis/common.py
++++ b/analysis/common.py
+@@ -16,8 +16,8 @@ for var, sub in [("TORCH_HOME", "torch"), ("HF_HOME", "hf"), ("HF_HUB_CACHE", "h
+     os.environ.setdefault(var, str(CACHE / sub))
+     (CACHE / sub).mkdir(parents=True, exist_ok=True)
+ 
+-AUDIO = PROJECT / "audio" / "pdoom.mp3"
+-STEMS = ROOT / "stems" / "htdemucs_ft" / "pdoom"
++AUDIO = PROJECT.parent / "audio" / "track.wav"
++STEMS = ROOT / "stems" / "htdemucs_ft" / "track"
+ LYRICS_SRC = PROJECT / "lyrics" / "lyrics.src.js"
+ DATA = PROJECT / "data"
+ QA = ROOT / "qa"
+@@ -40,7 +40,7 @@ def load_lyrics_src():
+ # (ffmpeg / libsndfile / browsers) is our time reference, so stems are shifted
+ # earlier by 1015 samples @ 44.1 kHz (measured by cross-correlation, constant
+ # over the whole song).
+-STEM_OFFSET_SAMPLES = 1015
++STEM_OFFSET_SAMPLES = 0  # stems rendered from the wav decode: no offset
+ STEM_OFFSET_SEC = STEM_OFFSET_SAMPLES / 44100
+ 
+ 
+diff --git a/analysis/ctcalign.py b/analysis/ctcalign.py
+index c15c6cd..df51c51 100644
+--- a/analysis/ctcalign.py
++++ b/analysis/ctcalign.py
+@@ -18,7 +18,7 @@ import torchaudio
+ from pron import pron
+ 
+ FRAME = 0.02  # s per emission frame
+-N_FRAMES = 7833
++N_FRAMES = 9058  # 181.16 s / 20 ms
+ ALPHA = ["-"] + list("abcdefghijklmnopqrstuvwxyz'")
+ AIDX = {c: i for i, c in enumerate(ALPHA)}
+ 
+diff --git a/analysis/pron.py b/analysis/pron.py
+index 7c0364f..0f7251e 100644
+--- a/analysis/pron.py
++++ b/analysis/pron.py
+@@ -6,33 +6,22 @@ pronunciation sub-words made of plain letters (and internal apostrophes).
+ import re
+ 
+ PRON = {
+-    "AGI": "ay gee i",
+-    "P(doom)": "pee doom", "P(doom),": "pee doom",
+-    "ChatGPT,": "chat gee pee tee",
+-    "FOOM": "foom",
+-    "NVDA": "en vee dee ay",
+-    "E": "ee",
+-    "MLP,": "em el pee",
+-    "CDR": "see dee are",
+-    "PTO": "pee tee oh",
+-    "GPU": "gee pee you",
+-    "RLHF": "are el aitch eff",
+-    "Killswitch": "kill switch",
+-    "Neumann's": "noymans",
+-    "shoggoth's": "shoggoths",
+-    "Post-Chinchilla,": "post chinchilla",
+-    "super-dense": "super dense",
+-    "pre-training": "pre training",
+-    "self-upgrade": "self upgrade",
+-    "'cause": "cause",
+-    "Gato,": "gato",
++    "B-three-hundred": "bee three hundred",
++    "A-I": "ay i",
++    "Qwen": "kwen",
++    "Huawei's": "wahways",
++    "Nine-sixty's": "nine sixties",
++    "DeepSeek": "deep seek",
++    "push-up": "push up",
++    "export-controlled?": "export controlled",
++    "Wait...": "wait",
++    "okay?": "okay",
+ }
+ 
+ # alternative pronunciations to test (scored by alignment likelihood)
+ ALT = {
+-    "NVDA": ["en vee dee ay", "envidia", "nvidia"],
+-    "Neumann's": ["noymans", "newmans"],
+-    "Gato,": ["gato", "gahtoe"],
++    "Huawei's": ["wahways", "hwaways"],
++    "Qwen": ["kwen", "chwen"],
+ }
+ 
+ 
+diff --git a/analysis/whisper_run.py b/analysis/whisper_run.py
+index f55583e..ff81689 100644
+--- a/analysis/whisper_run.py
++++ b/analysis/whisper_run.py
+@@ -27,7 +27,7 @@ def run(tag, model, prompt=None):
+ if __name__ == "__main__":
+     which = sys.argv[1] if len(sys.argv) > 1 else "turbo"
+     lyr = " ".join(t for _, _, t in common.load_lyrics_src())
+-    prompt = ("Song lyrics about AI doom: P(doom), FOOM, shoggoth, shinigami, Chinchilla, "
+-              "basilisk, Omega Point, RLHF, GPU, CDR, MLP, NVDA, Gato, Sydney, Ilya, Loom.")
++    prompt = ("Pop song lyrics about AI chips: B300, export license, Huawei Ascend, "
++              "DeepSeek, Qwen, Jensen, Beijing, Taiwan, karaoke, A-I.")
+     run(which, MODELS[which])
+     run(which + "_prompt", MODELS[which], prompt)
