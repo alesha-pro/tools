@@ -67,8 +67,38 @@ if ! command -v "$COLAB_BIN" >/dev/null 2>&1 && [ ! -x "$COLAB_BIN" ]; then
   exit 1
 fi
 
+IS_TTY=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  IS_TTY=1
+fi
+
+if [ "$IS_TTY" -eq 1 ]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_CYAN=""
+  C_GREEN=""
+  C_YELLOW=""
+fi
+
+clear_line() {
+  [ "$IS_TTY" -eq 1 ] && printf '\r\033[K' || true
+}
+
+fmt_duration() {
+  local s="${1:-0}"
+  printf '%02d:%02d' $((s / 60)) $((s % 60))
+}
+
 if [ ! -f "$KEY" ]; then
-  echo "[tunnel] SSH key $KEY not found. Generating ed25519 key..."
+  printf '%s[tunnel]%s SSH key %s not found. Generating ed25519 key...\n' "$C_CYAN" "$C_RESET" "$KEY"
   mkdir -p "$(dirname "$KEY")"
   ssh-keygen -t ed25519 -N "" -C "colab-cli" -f "$KEY"
 fi
@@ -82,6 +112,51 @@ probe_models() {
     MODELS_JSON="${resp%$'\n'*}"
     return 0
   fi
+  return 1
+}
+
+wait_for_tunnel() {
+  local pid="$1"
+  local max_wait="$2"
+  local label="$3"
+  local t0=$SECONDS
+  local last_probe=-1
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local idx=0
+
+  if [ "$IS_TTY" -eq 0 ] && [ -n "$label" ]; then
+    printf '%s\n' "$label"
+  fi
+
+  while true; do
+    local elapsed=$((SECONDS - t0))
+    if ! kill -0 "$pid" 2>/dev/null; then
+      clear_line
+      return 2
+    fi
+    if [ "$elapsed" -ge "$max_wait" ]; then
+      break
+    fi
+    if [ "$last_probe" -lt 0 ] || [ $((elapsed - last_probe)) -ge 1 ]; then
+      last_probe=$elapsed
+      if probe_models; then
+        clear_line
+        return 0
+      fi
+    fi
+    if [ "$IS_TTY" -eq 1 ] && [ -n "$label" ]; then
+      printf '\r\033[K  %s%s%s %s %s%s%s' \
+        "$C_CYAN" "${frames[$idx]}" "$C_RESET" \
+        "$label" \
+        "$C_DIM" "$(fmt_duration "$elapsed")" "$C_RESET"
+      idx=$(( (idx + 1) % ${#frames[@]} ))
+      sleep 0.2
+    else
+      sleep 1
+    fi
+  done
+
+  clear_line
   return 1
 }
 
@@ -148,48 +223,47 @@ print_ready_summary() {
     stop_cmd="${stop_cmd} ${SESSION} ${LOCAL_PORT}"
   fi
 
-  cat <<EOF
-
-========================================================================
-  GLM-5.3-Flash Uncensored — READY (200 OK)
-========================================================================
-  Status:             ONLINE (Colab session: ${SESSION}, ~10.05 CU/hr)
-  GPU:                NVIDIA RTX PRO 6000 Blackwell (96 GB)
-  Tier / Context:     ${tier_display} bpw EXL3 / ${ctx_display}
-  Tunnel Mode:        ${tunnel_mode_desc}
-  Local Host / IP:    127.0.0.1
-  Local Port:         ${LOCAL_PORT}
-  Model Name:         ${model_name}
-  OpenAI Base URL:    http://127.0.0.1:${LOCAL_PORT}/v1
-  Anthropic Base URL: http://127.0.0.1:${LOCAL_PORT}
-  Web UI:             http://127.0.0.1:${LOCAL_PORT}/
-  API Key:            sk-local (any non-empty string)
-
-  OpenAI env:
-    export OPENAI_BASE_URL="http://127.0.0.1:${LOCAL_PORT}/v1"
-    export OPENAI_API_KEY="sk-local"
-    export OPENAI_MODEL="${model_name}"
-
-  Claude Code:
-    ANTHROPIC_BASE_URL="http://127.0.0.1:${LOCAL_PORT}" \\
-    ANTHROPIC_AUTH_TOKEN="sk-local" \\
-    ANTHROPIC_MODEL="${model_name}" \\
-    claude
-
-  Quick curl check:
-    curl -s http://127.0.0.1:${LOCAL_PORT}/v1/models | head -c 200; echo
-
-  Stop & end Colab billing when done:
-    ${stop_cmd}
-========================================================================
-
-EOF
+  printf '\n'
+  printf '%s╭──────────────────────────────────────────────────────────────────────╮%s\n' "$C_GREEN" "$C_RESET"
+  printf '%s│%s  %s● GLM-5.3-Flash Uncensored — READY (200 OK)%s                         %s│%s\n' \
+    "$C_GREEN" "$C_RESET" "$C_GREEN$C_BOLD" "$C_RESET" "$C_GREEN" "$C_RESET"
+  printf '%s╰──────────────────────────────────────────────────────────────────────╯%s\n' "$C_GREEN" "$C_RESET"
+  printf '  %s%-19s%s %sONLINE%s %s(Colab session: %s, ~10.05 CU/hr)%s\n' \
+    "$C_DIM" "Status" "$C_RESET" "$C_GREEN$C_BOLD" "$C_RESET" "$C_DIM" "$SESSION" "$C_RESET"
+  printf '  %s%-19s%s %s\n' "$C_DIM" "GPU" "$C_RESET" "NVIDIA RTX PRO 6000 Blackwell (96 GB)"
+  printf '  %s%-19s%s %s%s bpw EXL3%s / %s\n' "$C_DIM" "Tier / Context" "$C_RESET" "$C_BOLD" "$tier_display" "$C_RESET" "$ctx_display"
+  printf '  %s%-19s%s %s\n' "$C_DIM" "Tunnel Mode" "$C_RESET" "$tunnel_mode_desc"
+  printf '  %s%-19s%s %s\n' "$C_DIM" "Local Host / IP" "$C_RESET" "127.0.0.1"
+  printf '  %s%-19s%s %s\n' "$C_DIM" "Local Port" "$C_RESET" "$LOCAL_PORT"
+  printf '  %s%-19s%s %s%s%s\n' "$C_DIM" "Model Name" "$C_RESET" "$C_BOLD" "$model_name" "$C_RESET"
+  printf '  %s%-19s%s %shttp://127.0.0.1:%s/v1%s\n' "$C_DIM" "OpenAI Base URL" "$C_RESET" "$C_CYAN" "$LOCAL_PORT" "$C_RESET"
+  printf '  %s%-19s%s %shttp://127.0.0.1:%s%s\n' "$C_DIM" "Anthropic Base URL" "$C_RESET" "$C_CYAN" "$LOCAL_PORT" "$C_RESET"
+  printf '  %s%-19s%s %shttp://127.0.0.1:%s/%s\n' "$C_DIM" "Web UI" "$C_RESET" "$C_CYAN" "$LOCAL_PORT" "$C_RESET"
+  printf '  %s%-19s%s %s\n' "$C_DIM" "API Key" "$C_RESET" "sk-local (any non-empty string)"
+  printf '\n'
+  printf '  %sOpenAI env%s\n' "$C_BOLD" "$C_RESET"
+  printf '    %sexport OPENAI_BASE_URL="http://127.0.0.1:%s/v1"%s\n' "$C_CYAN" "$LOCAL_PORT" "$C_RESET"
+  printf '    %sexport OPENAI_API_KEY="sk-local"%s\n' "$C_CYAN" "$C_RESET"
+  printf '    %sexport OPENAI_MODEL="%s"%s\n' "$C_CYAN" "$model_name" "$C_RESET"
+  printf '\n'
+  printf '  %sClaude Code%s\n' "$C_BOLD" "$C_RESET"
+  printf '    %sANTHROPIC_BASE_URL="http://127.0.0.1:%s" \\%s\n' "$C_CYAN" "$LOCAL_PORT" "$C_RESET"
+  printf '    %sANTHROPIC_AUTH_TOKEN="sk-local" \\%s\n' "$C_CYAN" "$C_RESET"
+  printf '    %sANTHROPIC_MODEL="%s" \\%s\n' "$C_CYAN" "$model_name" "$C_RESET"
+  printf '    %sclaude%s\n' "$C_CYAN" "$C_RESET"
+  printf '\n'
+  printf '  %sQuick curl check%s\n' "$C_BOLD" "$C_RESET"
+  printf '    %scurl -s http://127.0.0.1:%s/v1/models | head -c 200; echo%s\n' "$C_DIM" "$LOCAL_PORT" "$C_RESET"
+  printf '\n'
+  printf '  %sStop & end Colab billing when done%s\n' "$C_BOLD" "$C_RESET"
+  printf '    %s%s%s\n' "$C_YELLOW$C_BOLD" "$stop_cmd" "$C_RESET"
+  printf '%s────────────────────────────────────────────────────────────────────────%s\n\n' "$C_DIM" "$C_RESET"
 }
 
 SSH_PID=""
 cleanup() {
-  echo ""
-  echo "[tunnel] Stopped."
+  clear_line
+  printf '\n%s[tunnel]%s Stopped.\n' "$C_YELLOW" "$C_RESET"
   if [ -n "$SSH_PID" ] && kill -0 "$SSH_PID" 2>/dev/null; then
     kill "$SSH_PID" 2>/dev/null || true
     wait "$SSH_PID" 2>/dev/null || true
@@ -200,9 +274,17 @@ cleanup() {
 
 run_loop() {
   local printed_summary=0
+  local wait_label rc
   trap cleanup INT TERM
   while true; do
-    echo "[tunnel] Connecting 127.0.0.1:${LOCAL_PORT} -> Colab(${SESSION}):${REMOTE_PORT} ..."
+    if [ "$printed_summary" -eq 0 ] && [ "${TUNNEL_QUIET_SUMMARY:-0}" != "1" ]; then
+      wait_label="Opening SSH tunnel to 127.0.0.1:${LOCAL_PORT}..."
+    else
+      wait_label=""
+      printf '%s[tunnel]%s Connecting 127.0.0.1:%s -> Colab(%s):%s ...\n' \
+        "$C_CYAN" "$C_RESET" "$LOCAL_PORT" "$SESSION" "$REMOTE_PORT"
+    fi
+
     ssh -N \
       -L "127.0.0.1:${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}" \
       -i "$KEY" \
@@ -216,25 +298,22 @@ run_loop() {
       root@colab < /dev/null &
     SSH_PID=$!
 
-    for _ in $(seq 1 60); do
-      if ! kill -0 "$SSH_PID" 2>/dev/null; then
-        break
+    rc=0
+    wait_for_tunnel "$SSH_PID" 60 "$wait_label" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      if [ "$printed_summary" -eq 0 ] && [ "${TUNNEL_QUIET_SUMMARY:-0}" != "1" ]; then
+        print_ready_summary "foreground (Ctrl+C to close tunnel; Colab VM stays running)"
+        printed_summary=1
+      elif [ "$printed_summary" -eq 1 ]; then
+        printf '%s[tunnel]%s Reconnected at %s: http://127.0.0.1:%s/v1 %s(200 OK)%s\n' \
+          "$C_GREEN" "$C_RESET" "$(date '+%H:%M:%S')" "$LOCAL_PORT" "$C_GREEN" "$C_RESET"
       fi
-      if probe_models; then
-        if [ "$printed_summary" -eq 0 ] && [ "${TUNNEL_QUIET_SUMMARY:-0}" != "1" ]; then
-          print_ready_summary "foreground (Ctrl+C to close tunnel; Colab VM stays running)"
-          printed_summary=1
-        elif [ "$printed_summary" -eq 1 ]; then
-          echo "[tunnel] Reconnected at $(date '+%H:%M:%S'): http://127.0.0.1:${LOCAL_PORT}/v1 (200 OK)"
-        fi
-        break
-      fi
-      sleep 1
-    done
+    fi
 
     wait "$SSH_PID" || true
     SSH_PID=""
-    echo "[tunnel] Disconnected at $(date '+%H:%M:%S'). Reconnecting in 3s (Ctrl+C to stop)..."
+    printf '%s[tunnel]%s Disconnected at %s. Reconnecting in 3s (Ctrl+C to stop)...\n' \
+      "$C_YELLOW" "$C_RESET" "$(date '+%H:%M:%S')"
     sleep 3
   done
 }
@@ -246,7 +325,8 @@ if [ "$MODE" = "--bg" ]; then
       if probe_models; then
         print_ready_summary "background (already running, PID ${existing_pid}, log: ${LOGFILE})"
       else
-        echo "[tunnel] Already running (PID ${existing_pid}) on 127.0.0.1:${LOCAL_PORT}, waiting for 200 OK (log: ${LOGFILE})"
+        printf '%s[tunnel]%s Already running (PID %s) on 127.0.0.1:%s, waiting for 200 OK (log: %s)\n' \
+          "$C_CYAN" "$C_RESET" "$existing_pid" "$LOCAL_PORT" "$LOGFILE"
       fi
       exit 0
     fi
@@ -257,22 +337,21 @@ if [ "$MODE" = "--bg" ]; then
   bg_pid=$!
   echo "$bg_pid" > "$PIDFILE"
 
-  for _ in $(seq 1 30); do
-    if ! kill -0 "$bg_pid" 2>/dev/null; then
-      echo "[tunnel] Background tunnel exited unexpectedly. Log ($LOGFILE):" >&2
-      cat "$LOGFILE" >&2 || true
-      rm -f "$PIDFILE"
-      exit 1
-    fi
-    if probe_models; then
-      print_ready_summary "background (PID ${bg_pid}, log: ${LOGFILE})"
-      exit 0
-    fi
-    sleep 1
-  done
+  rc=0
+  wait_for_tunnel "$bg_pid" 30 "Opening SSH tunnel to 127.0.0.1:${LOCAL_PORT}..." || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    print_ready_summary "background (PID ${bg_pid}, log: ${LOGFILE})"
+    exit 0
+  elif [ "$rc" -eq 2 ]; then
+    printf '[tunnel] Background tunnel exited unexpectedly. Log (%s):\n' "$LOGFILE" >&2
+    cat "$LOGFILE" >&2 || true
+    rm -f "$PIDFILE"
+    exit 1
+  fi
 
-  echo "[tunnel] Started in background (PID ${bg_pid}), still waiting for /v1/models 200 OK."
-  echo "[tunnel] Check log: $LOGFILE"
+  printf '%s[tunnel]%s Started in background (PID %s), still waiting for /v1/models 200 OK.\n' \
+    "$C_YELLOW" "$C_RESET" "$bg_pid"
+  printf '  Check log: %s\n' "$LOGFILE"
 else
   run_loop
 fi

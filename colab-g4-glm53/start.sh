@@ -74,48 +74,183 @@ esac
 
 MODEL_NAME="glm-5.3-flash-uncensored-${TIER}bpw"
 
+LOCAL_IS_TTY=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  LOCAL_IS_TTY=1
+fi
+
+if [ "$LOCAL_IS_TTY" -eq 1 ]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_CYAN=""
+  C_GREEN=""
+  C_YELLOW=""
+fi
+
 if [ ! -f "$KEY" ]; then
-  echo "[start] Generating ed25519 SSH key for Colab at $KEY ..."
+  printf '%s[start]%s Generating ed25519 SSH key for Colab at %s ...\n' "$C_CYAN" "$C_RESET" "$KEY"
   mkdir -p "$(dirname "$KEY")"
   ssh-keygen -t ed25519 -N "" -C "colab-cli" -f "$KEY"
 fi
 
-echo "[start] Checking Colab session '${SESSION}' (tier=${TIER}bpw, ctx=${CTX}, local_port=${LOCAL_PORT})..."
+printf '\n'
+printf '%s╭──────────────────────────────────────────────────────────────────────╮%s\n' "$C_CYAN" "$C_RESET"
+printf '%s│%s  %sGLM-5.3-Flash Uncensored · Colab G4 Launcher%s                        %s│%s\n' \
+  "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
+printf '%s╰──────────────────────────────────────────────────────────────────────╯%s\n' "$C_CYAN" "$C_RESET"
+printf '  %s%-12s%s %s%s%s\n' "$C_DIM" "Session" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET"
+printf '  %s%-12s%s %s\n' "$C_DIM" "GPU" "$C_RESET" "Colab G4 (RTX PRO 6000 Blackwell 96 GB)"
+printf '  %s%-12s%s %s%s bpw%s\n' "$C_DIM" "Quant" "$C_RESET" "$C_CYAN" "$TIER" "$C_RESET"
+printf '  %s%-12s%s %s\n' "$C_DIM" "Context" "$C_RESET" "$CTX"
+printf '  %s%-12s%s %s\n' "$C_DIM" "Local Port" "$C_RESET" "$LOCAL_PORT"
+
 if ! "$COLAB_BIN" status -s "$SESSION" >/dev/null 2>&1; then
-  echo "[start] Creating new Colab G4 session '${SESSION}' (~10.05 CU/hr)..."
+  printf '\n  %s▸%s Creating new Colab G4 session %s%s%s (~10.05 CU/hr)...\n' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET"
   # NOTE: Never pass --high-mem for G4; G4 already allocates the full 176 GiB RAM / 48 vCPU shape.
   "$COLAB_BIN" new -s "$SESSION" --gpu G4
 fi
-"$COLAB_BIN" status -s "$SESSION"
-"$COLAB_BIN" usage
 
-echo "[start] Provisioning Project Maya (sm_120) + downloading ${HF_REPO} + starting server on G4..."
-"$COLAB_BIN" ssh -s "$SESSION" -i "$KEY" -- bash -s -- "$HF_REPO" "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" <<'REMOTE_EOF'
+printf '\n'
+if status_out="$("$COLAB_BIN" status -s "$SESSION" 2>&1)"; then
+  while IFS= read -r line; do
+    [ -n "$line" ] && printf '  %s%s%s\n' "$C_DIM" "$line" "$C_RESET"
+  done <<< "$status_out"
+fi
+if usage_out="$("$COLAB_BIN" usage 2>&1)"; then
+  while IFS= read -r line; do
+    [ -n "$line" ] && printf '  %s%s%s\n' "$C_DIM" "$line" "$C_RESET"
+  done <<< "$usage_out"
+fi
+
+"$COLAB_BIN" ssh -s "$SESSION" -i "$KEY" -- bash -s -- "$HF_REPO" "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" "$LOCAL_IS_TTY" <<'REMOTE_EOF'
 set -euo pipefail
 HF_REPO="$1"
 MODEL_DIR="$2"
 CTX="$3"
 SPEC_MIN_P="$4"
 TIER="$5"
+IS_TTY="${6:-0}"
+[ -n "${NO_COLOR:-}" ] && IS_TTY=0
+
+if [ "$IS_TTY" -eq 1 ]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_CYAN=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_RED=""
+fi
+
+cleanup_line() {
+  [ "$IS_TTY" -eq 1 ] && printf '\r\033[K' || true
+}
+trap 'cleanup_line; exit 130' INT TERM
+
+fmt_duration() {
+  local s="${1:-0}"
+  printf '%02d:%02d' $((s / 60)) $((s % 60))
+}
+
+step_header() {
+  printf '\n%s[%s/6]%s %s%s%s\n' "$C_CYAN$C_BOLD" "$1" "$C_RESET" "$C_BOLD" "$2" "$C_RESET"
+}
+
+step_ok() {
+  printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1"
+}
+
+fail_with_log() {
+  local msg="$1"
+  local logfile="$2"
+  local lines="${3:-50}"
+  cleanup_line
+  printf '  %s✗ %s%s\n' "$C_RED" "$msg" "$C_RESET" >&2
+  if [ -f "$logfile" ]; then
+    printf 'Last %s lines of %s:\n' "$lines" "$logfile" >&2
+    tail -n "$lines" "$logfile" >&2 || true
+  fi
+  exit 1
+}
+
+LAST_DURATION=0
+run_with_spinner() {
+  local label="$1"
+  local logfile="$2"
+  shift 2
+  local t0=$SECONDS
+  "$@" > "$logfile" 2>&1 &
+  local pid=$!
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local idx=0
+  if [ "$IS_TTY" -eq 1 ]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      local elapsed=$((SECONDS - t0))
+      printf '\r\033[K  %s%s%s %s %s%s%s' \
+        "$C_CYAN" "${frames[$idx]}" "$C_RESET" \
+        "$label" \
+        "$C_DIM" "$(fmt_duration "$elapsed")" "$C_RESET"
+      idx=$(( (idx + 1) % ${#frames[@]} ))
+      sleep 0.15
+    done
+    printf '\r\033[K'
+  else
+    printf '  %s\n' "$label"
+  fi
+  local rc=0
+  wait "$pid" || rc=$?
+  LAST_DURATION=$((SECONDS - t0))
+  return "$rc"
+}
 
 export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-echo "=== [G4] 1. Tools & Python deps ==="
-if ! command -v ninja >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1; then
-  apt-get -qq update
-  apt-get -qq install -y aria2 ninja-build cmake build-essential >/dev/null
+step_header 1 "Checking tools & Python dependencies"
+install_deps() {
+  if ! command -v ninja >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1; then
+    apt-get -qq update
+    apt-get -qq install -y aria2 ninja-build cmake build-essential
+  fi
+  if ! python3 -c "import huggingface_hub, jinja2, regex, yaml, tqdm, requests, PIL, psutil, jsonschema" 2>/dev/null; then
+    pip -q install -U huggingface_hub jinja2 regex pyyaml tqdm requests pillow psutil "jsonschema>=4.18,<5"
+  fi
+}
+if command -v ninja >/dev/null 2>&1 && command -v cmake >/dev/null 2>&1 && \
+   python3 -c "import huggingface_hub, jinja2, regex, yaml, tqdm, requests, PIL, psutil, jsonschema" 2>/dev/null; then
+  step_ok "Cached"
+else
+  run_with_spinner "Installing build tools & Python packages..." /content/maya-deps.log install_deps || \
+    fail_with_log "Failed to install tools/dependencies." /content/maya-deps.log 50
+  step_ok "Dependencies ready in $(fmt_duration "$LAST_DURATION")"
 fi
-python3 -c "import huggingface_hub, jinja2, regex, yaml, tqdm, requests, PIL, psutil, jsonschema" 2>/dev/null || \
-  pip -q install -U huggingface_hub jinja2 regex pyyaml tqdm requests pillow psutil "jsonschema>=4.18,<5" >/dev/null
 
-echo "=== [G4] 2. Clone & build Project Maya for sm_120 ==="
+step_header 2 "Building Project Maya (CUDA sm_120)"
 cd /content
 if [ ! -d /content/project-maya ]; then
-  git clone --depth 1 https://github.com/mw00/project-maya.git
+  run_with_spinner "Cloning Project Maya..." /content/maya-build.log \
+    git clone --depth 1 https://github.com/mw00/project-maya.git /content/project-maya || \
+    fail_with_log "Failed to clone Project Maya." /content/maya-build.log 50
 fi
 cd /content/project-maya
 
-if [ ! -x /content/project-maya/build/maya ]; then
+build_maya() {
   python3 -c 'import setup as S; S.get_llama_cpp()'
   cmake -G Ninja -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
@@ -127,37 +262,92 @@ if [ ! -x /content/project-maya/build/maya ]; then
     -DCUDAToolkit_ROOT=/usr/local/cuda \
     -DSTRATA_GGML_DIR=/content/project-maya/third_party/llama.cpp
   cmake --build build --target maya -j 24
+}
+
+if [ -x /content/project-maya/build/maya ]; then
+  step_ok "Cached"
+else
+  run_with_spinner "Building Maya (CUDA sm_120)..." /content/maya-build.log build_maya || \
+    fail_with_log "Project Maya build failed." /content/maya-build.log 50
+  step_ok "Built in $(fmt_duration "$LAST_DURATION")"
 fi
 
-echo "=== [G4] 3. Download DFlash2 drafter (665 MB) + model (${HF_REPO}) ==="
+step_header 3 "Downloading DFlash2 drafter (665 MB) & ${HF_REPO}"
 mkdir -p /content/models/dflash2 "/content/models/${MODEL_DIR}"
-if [ ! -f /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf ]; then
-  curl -sSL -o /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf \
+
+need_dflash=0
+need_model=0
+[ ! -f /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf ] && need_dflash=1
+[ ! -f "/content/models/${MODEL_DIR}/pack/dense.bin" ] && need_model=1
+
+download_dflash() {
+  local tmp="/content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf.tmp"
+  rm -f "$tmp"
+  curl -fSL -o "$tmp" \
     "https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF/resolve/f3569acb7f9cee95e66d24442d75536eb00ab842/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf"
-fi
+  mv -f "$tmp" /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf
+}
 
-# Clean other model folders when switching tiers on Colab's ephemeral 236 GB disk
-if [ ! -f "/content/models/${MODEL_DIR}/pack/dense.bin" ]; then
-  for d in /content/models/MikeRoz-*; do
-    [ -d "$d" ] && [ "$(basename "$d")" != "$MODEL_DIR" ] && rm -rf "$d"
-  done
-  env HF_XET_HIGH_PERFORMANCE=1 python3 - "$HF_REPO" "/content/models/${MODEL_DIR}" <<'PY'
-import sys, time
+if [ "$need_dflash" -eq 0 ] && [ "$need_model" -eq 0 ]; then
+  step_ok "Cached"
+else
+  if [ "$need_dflash" -eq 1 ]; then
+    run_with_spinner "Downloading DFlash2 drafter (665 MB)..." /content/maya-dflash.log download_dflash || \
+      fail_with_log "Failed to download DFlash2 drafter." /content/maya-dflash.log 50
+    step_ok "DFlash2 drafter downloaded in $(fmt_duration "$LAST_DURATION")"
+  else
+    step_ok "DFlash2 drafter cached"
+  fi
+
+  if [ "$need_model" -eq 1 ]; then
+    # Clean other model folders when switching tiers on Colab's ephemeral 236 GB disk
+    for d in /content/models/MikeRoz-*; do
+      [ -d "$d" ] && [ "$(basename "$d")" != "$MODEL_DIR" ] && rm -rf "$d"
+    done
+    dl_t0=$SECONDS
+    printf '  %s▸%s Downloading %s -> /content/models/%s\n' "$C_CYAN" "$C_RESET" "$HF_REPO" "$MODEL_DIR"
+    env HF_XET_HIGH_PERFORMANCE=1 python3 - "$HF_REPO" "/content/models/${MODEL_DIR}" "$IS_TTY" <<'PY'
+import inspect, os, sys
+
+repo, dst, is_tty = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+if not is_tty:
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 from huggingface_hub import snapshot_download
-repo, dst = sys.argv[1], sys.argv[2]
-t0 = time.time()
-print(f"Downloading {repo} -> {dst} ...", flush=True)
-snapshot_download(repo_id=repo, local_dir=dst, max_workers=8)
-print(f"Download finished in {time.time()-t0:.1f}s", flush=True)
+
+kwargs = {"repo_id": repo, "local_dir": dst, "max_workers": 8}
+if is_tty:
+    try:
+        from huggingface_hub.utils import tqdm as hf_tqdm
+
+        class LiveTqdm(hf_tqdm):
+            def __init__(self, *args, **kw):
+                if kw.get("disable") is None:
+                    kw["disable"] = False
+                super().__init__(*args, **kw)
+
+        if "tqdm_class" in inspect.signature(snapshot_download).parameters:
+            kwargs["tqdm_class"] = LiveTqdm
+    except Exception:
+        pass
+
+snapshot_download(**kwargs)
 PY
+    step_ok "Model weights downloaded in $(fmt_duration "$((SECONDS - dl_t0))")"
+  fi
 fi
 
-echo "=== [G4] 4. Pack EXL3 (no weight copy) ==="
-if [ ! -f "/content/models/${MODEL_DIR}/pack/dense.bin" ]; then
-  python3 /content/project-maya/tools/exl3_pack.py --model "/content/models/${MODEL_DIR}"
+step_header 4 "Packing EXL3 weights (zero-copy)"
+if [ -f "/content/models/${MODEL_DIR}/pack/dense.bin" ]; then
+  step_ok "Cached"
+else
+  run_with_spinner "Packing EXL3 weights..." /content/maya-pack.log \
+    python3 /content/project-maya/tools/exl3_pack.py --model "/content/models/${MODEL_DIR}" || \
+    fail_with_log "Failed to pack EXL3 weights." /content/maya-pack.log 50
+  step_ok "Packed in $(fmt_duration "$LAST_DURATION")"
 fi
 
-echo "=== [G4] 5. Write tuned config /content/maya-glm53.json ==="
+step_header 5 "Writing Maya server config"
 python3 - "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" <<'PY'
 import sys, json
 model_dir, ctx, spec_p, tier = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
@@ -198,10 +388,15 @@ cfg = {
 }
 with open("/content/maya-glm53.json", "w") as f:
     json.dump(cfg, f, indent=2)
-print(json.dumps(cfg, indent=2))
 PY
+if [ "$CTX" -le 131072 ]; then
+  KV_DESC="k8v4"
+else
+  KV_DESC="int8 (kv_resident=20480)"
+fi
+step_ok "Config ready: ${KV_DESC}, DFlash2, spec_min_p=${SPEC_MIN_P}, CPU_LANE=18, DSA_GRAPHS=1"
 
-echo "=== [G4] 6. Start Maya server on 127.0.0.1:8090 ==="
+step_header 6 "Loading GLM-5.3-Flash (${TIER} bpw) into 96 GB VRAM"
 pkill -f "serve/server.py" 2>/dev/null || true
 pkill -f "build/maya" 2>/dev/null || true
 sleep 1
@@ -212,26 +407,54 @@ nohup python3 /content/project-maya/serve/server.py \
   --host 127.0.0.1 \
   --port 8090 \
   > /content/maya-server.log 2>&1 < /dev/null &
+srv_pid=$!
 
-echo "Waiting for model load (cold load ~3-5 min first time, ~25s warm)..."
 ready=0
-for i in $(seq 1 180); do
-  if curl -sf http://127.0.0.1:8090/v1/models >/dev/null 2>&1; then
-    echo "SERVER READY after $((i*3))s!"
-    ready=1
+t0=$SECONDS
+last_probe=-1
+last_log=0
+frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+idx=0
+
+if [ "$IS_TTY" -eq 0 ]; then
+  printf '  Waiting for model load (cold ~3-5 min first time, ~25s warm)...\n'
+fi
+
+while true; do
+  elapsed=$((SECONDS - t0))
+  if ! kill -0 "$srv_pid" 2>/dev/null; then
+    fail_with_log "Maya server exited unexpectedly during load." /content/maya-server.log 40
+  fi
+  if [ "$elapsed" -ge 540 ]; then
     break
   fi
-  if [ $((i % 10)) -eq 0 ]; then
-    echo "  still loading... ($((i*3))s)"
+  if [ "$last_probe" -lt 0 ] || [ $((elapsed - last_probe)) -ge 2 ]; then
+    last_probe=$elapsed
+    if curl -sf http://127.0.0.1:8090/v1/models >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
   fi
-  sleep 3
+  if [ "$IS_TTY" -eq 1 ]; then
+    printf '\r\033[K  %s%s%s Loading model into VRAM... %s%s%s' \
+      "$C_CYAN" "${frames[$idx]}" "$C_RESET" \
+      "$C_DIM" "$(fmt_duration "$elapsed")" "$C_RESET"
+    idx=$(( (idx + 1) % ${#frames[@]} ))
+    sleep 0.2
+  else
+    if [ "$elapsed" -gt 0 ] && [ $((elapsed / 30)) -gt "$last_log" ]; then
+      last_log=$((elapsed / 30))
+      printf '  still loading... (%s)\n' "$(fmt_duration "$elapsed")"
+    fi
+    sleep 2
+  fi
 done
+
+cleanup_line
 if [ "$ready" -ne 1 ]; then
-  echo "ERROR: Maya server did not become ready within 540s. Last 40 log lines:" >&2
-  tail -n 40 /content/maya-server.log >&2 || true
-  exit 1
+  fail_with_log "Maya server did not become ready within 540s." /content/maya-server.log 40
 fi
-curl -sf http://127.0.0.1:8090/v1/models && echo ""
+step_ok "Model ready in $(fmt_duration "$((SECONDS - t0))")"
 REMOTE_EOF
 
 METAFILE="/tmp/colab-tunnel-${SESSION}-${LOCAL_PORT}.env"
@@ -240,9 +463,6 @@ MODEL_TIER="${TIER}"
 MODEL_CTX="${CTX}"
 MODEL_NAME="${MODEL_NAME}"
 EOF
-
-echo ""
-echo "[start] Remote Maya server is up. Opening SSH tunnel to 127.0.0.1:${LOCAL_PORT}..."
 
 export MODEL_TIER="$TIER"
 export MODEL_CTX="$CTX"
