@@ -112,7 +112,9 @@ printf '  %s%-12s%s %s%s bpw%s\n' "$C_DIM" "Quant" "$C_RESET" "$C_CYAN" "$TIER" 
 printf '  %s%-12s%s %s\n' "$C_DIM" "Context" "$C_RESET" "$CTX"
 printf '  %s%-12s%s %s\n' "$C_DIM" "Local Port" "$C_RESET" "$LOCAL_PORT"
 
-if ! "$COLAB_BIN" status -s "$SESSION" >/dev/null 2>&1; then
+session_rc=0
+session_check="$("$COLAB_BIN" status -s "$SESSION" 2>&1)" || session_rc=$?
+if [ "$session_rc" -ne 0 ] || grep -qiE "not found|no active sessions|does not exist" <<<"$session_check"; then
   printf '\n  %s▸%s Creating new Colab G4 session %s%s%s (~10.05 CU/hr)...\n' \
     "$C_YELLOW" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET"
   # NOTE: Never pass --high-mem for G4; G4 already allocates the full 176 GiB RAM / 48 vCPU shape.
