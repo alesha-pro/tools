@@ -1,0 +1,27 @@
+{
+  "exe": "/content/project-maya/build/maya",
+  "pack": "/content/models/MikeRoz-2.51bpw-uncensored/pack",
+  "tokenizer": "/content/models/MikeRoz-2.51bpw-uncensored/pack/tokenizer",
+  "model": "glm-5.3-flash-uncensored-2.51bpw",
+  "model_name": "glm-5.3-flash-uncensored-2.51bpw",
+  "host": "127.0.0.1",
+  "port": 8090,
+  "max_context": 131072,
+  "args": [
+    "--glm-pack", "/content/models/MikeRoz-2.51bpw-uncensored/pack",
+    "--max-context", "131072",
+    "--kv", "k8v4",
+    "--vram-reserve-mib", "200",
+    "--glm-ram-resident",
+    "--dflash", "/content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf",
+    "--spec-min-p", "0.95"
+  ],
+  "env": {
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_VISIBLE_DEVICES": "0",
+    "MAYA_GLM_PCIE_SHARE": "0.00",
+    "MAYA_GLM_CPU_LANE": "18",
+    "MAYA_GLM_NGRAM_DRAFT": "1",
+    "MAYA_GLM_DSA_GRAPHS": "1"
+  }
+}

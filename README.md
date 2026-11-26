@@ -55,6 +55,23 @@ cd qwen-image-2.1
 python3 install/setup.py check
 ```
 
+### [colab-g4-glm53](colab-g4-glm53)
+
+Abliterated **GLM-5.3-Flash (321B-A18B)** on **Google Colab G4** (RTX PRO 6000
+Blackwell, 96 GB VRAM, 176 GiB RAM) via Project Maya (`v1.1.74`) and DFlash2
+speculative decoding, tunneled straight to `127.0.0.1:18100`.
+
+Hits **102.3 tok/s** decode at **131K** (`2.51 bpw` EXL3, `k8v4` KV) and
+**98.9 tok/s** at **262K**, with `3.05 bpw` and `4.05 bpw` tiers ready out of
+the box at **10.05 CU/hr** (~19.9 hours on Google AI Pro, ~99.5 hours per
+1,000 CU on Ultra). Exposes local OpenAI (`/v1`), Anthropic (`/v1/messages`),
+and Web UI endpoints plus reference configs.
+
+```bash
+cd colab-g4-glm53
+./start.sh
+```
+
 ### [skills](skills)
 
 Agent skills that stand on their own.
