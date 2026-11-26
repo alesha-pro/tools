@@ -5,7 +5,7 @@
 # and opens an SSH port-forward tunnel to http://127.0.0.1:<PORT>/v1.
 #
 # Usage:
-#   ./start.sh [2.51|3.05|4.05] [--ctx 131072|262144] [--port 18100] [--session glm53] [--bg]
+#   ./start.sh [2.51|3.05|4.05] [--ctx 131072|262144] [--port 18100] [--session glm53] [--bg] [--no-wait]
 #
 # Examples:
 #   ./start.sh                 # Default: 2.51bpw (~102 tok/s), 131K ctx, localhost:18100
@@ -23,6 +23,7 @@ CTX="131072"
 LOCAL_PORT="18100"
 SESSION="glm53"
 TUNNEL_MODE="fg"
+WAIT_FOR_GPU="1"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,6 +41,7 @@ while [ $# -gt 0 ]; do
       SESSION="$2"; shift 2
       ;;
     --bg)           TUNNEL_MODE="--bg"; shift ;;
+    --no-wait)      WAIT_FOR_GPU="0"; shift ;;
     -h|--help)
       sed -n '2,15p' "$0"
       exit 0
@@ -112,13 +114,101 @@ printf '  %s%-12s%s %s%s bpw%s\n' "$C_DIM" "Quant" "$C_RESET" "$C_CYAN" "$TIER" 
 printf '  %s%-12s%s %s\n' "$C_DIM" "Context" "$C_RESET" "$CTX"
 printf '  %s%-12s%s %s\n' "$C_DIM" "Local Port" "$C_RESET" "$LOCAL_PORT"
 
+sleep_with_countdown() {
+  local secs="$1"
+  local attempt="$2"
+  local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local idx=0
+  local rem="$secs"
+
+  if [ "$LOCAL_IS_TTY" -eq 1 ]; then
+    while [ "$rem" -gt 0 ]; do
+      local f="${frames:$((idx % 10)):1}"
+      printf '\r  %s%s%s G4 busy (503). Next check (#%s) in %02ds... %s(Ctrl+C to stop)%s\033[K' \
+        "$C_YELLOW" "$f" "$C_RESET" "$attempt" "$rem" "$C_DIM" "$C_RESET"
+      sleep 1
+      rem=$((rem - 1))
+      idx=$((idx + 1))
+    done
+    printf '\r\033[K'
+  else
+    printf '  G4 busy (503). Waiting %ss before retry #%s...\n' "$secs" "$attempt"
+    sleep "$secs"
+  fi
+}
+
+create_g4_session() {
+  local attempt=1
+  local base_delays=(30 45 60 90 120)
+  local max_cap="${COLAB_WAIT_CAP:-120}"
+  local custom_base="${COLAB_RETRY_BASE:-}"
+  local max_attempts="${COLAB_MAX_ATTEMPTS:-0}"
+
+  printf '\n  %s▸%s Creating new Colab G4 session %s%s%s (~10.05 CU/hr)...\n' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET"
+
+  while true; do
+    local out rc=0
+    # NOTE: Never pass --high-mem for G4; G4 already allocates the full 176 GiB RAM / 48 vCPU shape.
+    # Disable colab-cli's internal 4x retry burst so we control rate-limit-safe spacing ourselves.
+    out="$(COLAB_CLI_ASSIGN_RETRIES=0 "$COLAB_BIN" new -s "$SESSION" --gpu G4 2>&1)" || rc=$?
+
+    if [ "$rc" -eq 0 ] && ! grep -qiE "Error:|Traceback|Service Unavailable|Allocation refused|Backend rejected" <<<"$out"; then
+      printf '  %s✓%s Colab G4 session %s%s%s allocated (attempt #%s)\n' \
+        "$C_GREEN" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET" "$attempt"
+      return 0
+    fi
+
+    # Hard stops: quota, too many sessions (412), rate-limit (429), auth (401/403), invalid tier (400).
+    # Never retry these so we don't hit Colab API rate limits or account locks.
+    if grep -qiE "Allocation refused|precondition failed|Backend rejected|TooManyAssignments|Too Many Requests|Unauthorized|Forbidden|not entitled|no quota|insufficient|invalid_grant|token.*expired|HTTP[^0-9]*(401|403|429)" <<<"$out"; then
+      printf '\n  %s✗%s Colab rejected allocation (hard stop, not retrying):\n' "$C_YELLOW" "$C_RESET" >&2
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+
+    # Retry only transient capacity / gateway / timeout errors (503/502/504/ReadTimeout)
+    if [ "$WAIT_FOR_GPU" = "1" ] && grep -qiE "Service Unavailable|503|502|504|ReadTimeout|timed out|Temporary|capacity|Resource Exhausted" <<<"$out"; then
+      if [ "$max_attempts" -gt 0 ] && [ "$attempt" -ge "$max_attempts" ]; then
+        printf '\n  %s✗%s Reached COLAB_MAX_ATTEMPTS=%s without available G4.\n' "$C_YELLOW" "$C_RESET" "$max_attempts" >&2
+        return 1
+      fi
+
+      local delay
+      if [ -n "$custom_base" ]; then
+        delay="$custom_base"
+      else
+        local idx=$((attempt - 1))
+        if [ "$idx" -ge "${#base_delays[@]}" ]; then
+          idx=$((${#base_delays[@]} - 1))
+        fi
+        delay="${base_delays[$idx]}"
+        # Add small +/-4s jitter when waiting >=30s so polling never looks robotic
+        if [ "$delay" -ge 30 ]; then
+          local jitter=$(( (RANDOM % 9) - 4 ))
+          delay=$((delay + jitter))
+        fi
+      fi
+      if [ "$delay" -gt "$max_cap" ]; then
+        delay="$max_cap"
+      fi
+      [ "$delay" -lt 1 ] && delay=1
+
+      attempt=$((attempt + 1))
+      sleep_with_countdown "$delay" "$attempt"
+      continue
+    fi
+
+    printf '\n  %s✗%s Failed to create Colab G4 session:\n' "$C_YELLOW" "$C_RESET" >&2
+    printf '%s\n' "$out" >&2
+    return 1
+  done
+}
+
 session_rc=0
 session_check="$("$COLAB_BIN" status -s "$SESSION" 2>&1)" || session_rc=$?
 if [ "$session_rc" -ne 0 ] || grep -qiE "not found|no active sessions|does not exist" <<<"$session_check"; then
-  printf '\n  %s▸%s Creating new Colab G4 session %s%s%s (~10.05 CU/hr)...\n' \
-    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET"
-  # NOTE: Never pass --high-mem for G4; G4 already allocates the full 176 GiB RAM / 48 vCPU shape.
-  "$COLAB_BIN" new -s "$SESSION" --gpu G4
+  create_g4_session
 fi
 
 printf '\n'
