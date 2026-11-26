@@ -103,6 +103,11 @@ if [ ! -f "$KEY" ]; then
   ssh-keygen -t ed25519 -N "" -C "colab-cli" -f "$KEY"
 fi
 
+# Prevent macOS idle sleep while provisioning & tunneling (automatically exits when $$ exits)
+if [ "$(uname -s)" = "Darwin" ] && command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -w $$ >/dev/null 2>&1 &
+fi
+
 printf '\n'
 printf '%s╭──────────────────────────────────────────────────────────────────────╮%s\n' "$C_CYAN" "$C_RESET"
 printf '%s│%s  %sGLM-5.3-Flash Uncensored · Colab G4 Launcher%s                        %s│%s\n' \
@@ -228,7 +233,10 @@ if usage_out="$("$COLAB_BIN" usage 2>&1)"; then
   done <<< "$usage_out"
 fi
 
-"$COLAB_BIN" ssh -s "$SESSION" -i "$KEY" -- bash -s -- "$HF_REPO" "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" "$LOCAL_IS_TTY" <<'REMOTE_EOF'
+REMOTE_SCRIPT_FILE="$(mktemp)"
+trap 'rm -f "$REMOTE_SCRIPT_FILE"' EXIT
+
+cat > "$REMOTE_SCRIPT_FILE" <<'REMOTE_EOF'
 set -euo pipefail
 HF_REPO="$1"
 MODEL_DIR="$2"
@@ -284,7 +292,7 @@ fail_with_log() {
     printf 'Last %s lines of %s:\n' "$lines" "$logfile" >&2
     tail -n "$lines" "$logfile" >&2 || true
   fi
-  exit 1
+  exit 42
 }
 
 LAST_DURATION=0
@@ -340,7 +348,8 @@ fi
 
 step_header 2 "Building Project Maya (CUDA sm_120)"
 cd /content
-if [ ! -d /content/project-maya ]; then
+if [ ! -f /content/project-maya/CMakeLists.txt ]; then
+  rm -rf /content/project-maya
   run_with_spinner "Cloning Project Maya..." /content/maya-build.log \
     git clone --depth 1 https://github.com/mw00/project-maya.git /content/project-maya || \
     fail_with_log "Failed to clone Project Maya." /content/maya-build.log 50
@@ -375,7 +384,7 @@ mkdir -p /content/models/dflash2 "/content/models/${MODEL_DIR}"
 need_dflash=0
 need_model=0
 [ ! -f /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf ] && need_dflash=1
-[ ! -f "/content/models/${MODEL_DIR}/pack/dense.bin" ] && need_model=1
+[ ! -f "/content/models/${MODEL_DIR}/pack/.packed_ok" ] && need_model=1
 
 download_dflash() {
   local tmp="/content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf.tmp"
@@ -435,12 +444,14 @@ PY
 fi
 
 step_header 4 "Packing EXL3 weights (zero-copy)"
-if [ -f "/content/models/${MODEL_DIR}/pack/dense.bin" ]; then
+if [ -f "/content/models/${MODEL_DIR}/pack/.packed_ok" ]; then
   step_ok "Cached"
 else
+  rm -rf "/content/models/${MODEL_DIR}/pack"
   run_with_spinner "Packing EXL3 weights..." /content/maya-pack.log \
     python3 /content/project-maya/tools/exl3_pack.py --model "/content/models/${MODEL_DIR}" || \
     fail_with_log "Failed to pack EXL3 weights." /content/maya-pack.log 50
+  touch "/content/models/${MODEL_DIR}/pack/.packed_ok"
   step_ok "Packed in $(fmt_duration "$LAST_DURATION")"
 fi
 
@@ -553,6 +564,65 @@ if [ "$ready" -ne 1 ]; then
 fi
 step_ok "Model ready in $(fmt_duration "$((SECONDS - t0))")"
 REMOTE_EOF
+
+run_remote_provision() {
+  local max_ssh_tries=4
+  local ssh_try=1
+  local ssh_bin="${SSH_BIN:-ssh}"
+
+  while [ "$ssh_try" -le "$max_ssh_tries" ]; do
+    local rc=0
+    "$ssh_bin" -i "$KEY" \
+      -o "ProxyCommand=${COLAB_BIN} ssh --proxy-mode -s ${SESSION} -i ${KEY}" \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ServerAliveInterval=20 \
+      -o ServerAliveCountMax=6 \
+      -o ConnectTimeout=25 \
+      root@colab \
+      "bash -s -- $(printf '%q ' "$HF_REPO" "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" "$LOCAL_IS_TTY")" \
+      < "$REMOTE_SCRIPT_FILE" || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    fi
+    # 42 = explicit remote error from fail_with_log; 130 = Ctrl+C interrupt
+    if [ "$rc" -eq 42 ] || [ "$rc" -eq 130 ]; then
+      return "$rc"
+    fi
+
+    if [ "$ssh_try" -lt "$max_ssh_tries" ]; then
+      local st_rc=0 st_out
+      st_out="$("$COLAB_BIN" status -s "$SESSION" 2>&1)" || st_rc=$?
+      if [ "$st_rc" -ne 0 ] || grep -qiE "not found|no active sessions|does not exist" <<<"$st_out"; then
+        printf '\n  %s✗%s Colab session %s%s%s is no longer active.\n' \
+          "$C_YELLOW" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET" >&2
+        if [ "$WAIT_FOR_GPU" = "1" ]; then
+          printf '  %s▸%s Re-allocating G4 session...\n' "$C_YELLOW" "$C_RESET"
+          create_g4_session
+          ssh_try=$((ssh_try + 1))
+          continue
+        fi
+        return 1
+      fi
+
+      local wait_s=$((ssh_try * 5))
+      printf '\n  %s▸%s SSH/WebSocket interrupted (rc=%s). Keep-alive reconnecting (%s/%s) in %ss...\n' \
+        "$C_YELLOW" "$C_RESET" "$rc" "$ssh_try" "$max_ssh_tries" "$wait_s" >&2
+      sleep "$wait_s"
+    fi
+    ssh_try=$((ssh_try + 1))
+  done
+
+  printf '\n  %s✗%s Could not complete SSH provisioning after %s attempts.\n' \
+    "$C_YELLOW" "$C_RESET" "$max_ssh_tries" >&2
+  printf '  If Colab VM is still running, stop billing with: %s/stop.sh %s %s\n' \
+    "$SCRIPT_DIR" "$SESSION" "$LOCAL_PORT" >&2
+  return 1
+}
+
+run_remote_provision
+rm -f "$REMOTE_SCRIPT_FILE"
 
 METAFILE="/tmp/colab-tunnel-${SESSION}-${LOCAL_PORT}.env"
 cat > "$METAFILE" <<EOF
