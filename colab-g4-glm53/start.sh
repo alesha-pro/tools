@@ -159,16 +159,21 @@ create_g4_session() {
       return 0
     fi
 
+    # Strip Rich traceback box lines (e.g. `│ 170 │ except TooManyAssignmentsError:`)
+    # and unwrap hard-wrapped lines so we only inspect the actual error message.
+    local clean_err
+    clean_err="$(printf '%s\n' "$out" | sed -E '/^[╭│╰]/d' | tr '\n' ' ' | tr -s ' ')"
+
     # Hard stops: quota, too many sessions (412), rate-limit (429), auth (401/403), invalid tier (400).
     # Never retry these so we don't hit Colab API rate limits or account locks.
-    if grep -qiE "Allocation refused|precondition failed|Backend rejected|TooManyAssignments|Too Many Requests|Unauthorized|Forbidden|not entitled|no quota|insufficient|invalid_grant|token.*expired|HTTP[^0-9]*(401|403|429)" <<<"$out"; then
+    if grep -qiE "Allocation refused|precondition failed|Backend rejected|TooManyAssignmentsError|Too Many Requests|Unauthorized|Forbidden|not entitled|no quota|insufficient|invalid_grant|token.*expired|HTTP[^0-9]*(401|403|429)" <<<"$clean_err"; then
       printf '\n  %s✗%s Colab rejected allocation (hard stop, not retrying):\n' "$C_YELLOW" "$C_RESET" >&2
       printf '%s\n' "$out" >&2
       return 1
     fi
 
     # Retry only transient capacity / gateway / timeout errors (503/502/504/ReadTimeout)
-    if [ "$WAIT_FOR_GPU" = "1" ] && grep -qiE "Service Unavailable|503|502|504|ReadTimeout|timed out|Temporary|capacity|Resource Exhausted" <<<"$out"; then
+    if [ "$WAIT_FOR_GPU" = "1" ] && grep -qiE "Service[[:space:]]*Unavailable|503|502|504|ReadTimeout|timed out|Temporary|capacity|Resource[[:space:]]*Exhausted" <<<"$clean_err"; then
       if [ "$max_attempts" -gt 0 ] && [ "$attempt" -ge "$max_attempts" ]; then
         printf '\n  %s✗%s Reached COLAB_MAX_ATTEMPTS=%s without available G4.\n' "$C_YELLOW" "$C_RESET" "$max_attempts" >&2
         return 1
