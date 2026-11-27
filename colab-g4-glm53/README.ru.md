@@ -47,7 +47,7 @@ cd tools/colab-g4-glm53
 - `4.05 bpw` (153.8 GiB): **~18–20 минут**
 
 После старта доступны локальные эндпоинты:
-- **OpenAI API:** `http://127.0.0.1:18100/v1` (любой API-ключ, например `sk-local`)
+- **OpenAI API:** `http://127.0.0.1:18100/v1` (случайный Bearer-токен в `~/.local/state/colab-g4-glm53/session-glm53.token`, `0600`; либо `--no-auth`)
 - **Anthropic API:** `http://127.0.0.1:18100` (`/v1/messages` с поддержкой `thinking` и tool calls)
 - **Web UI + монитор Maya:** `http://127.0.0.1:18100/`
 
