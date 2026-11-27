@@ -75,6 +75,16 @@ If your laptop sleeps or the WebSocket drops while the Colab VM is still running
 
 `stop.sh` kills the local tunnel process and lingering port-forwards, calls `colab stop -s glm53` to end billing, and prints `colab sessions` and `colab usage` so you can verify the usage rate is back to `0.00/hr`.
 
+### Stop orphan sessions too (`--all`)
+
+Sessions created outside this repo's local `colab` CLI store (e.g. the web dashboard or another machine) show up as `[?]` in `colab sessions` and **cannot** be stopped with a bare `colab stop` or `colab stop -s <name>` — the CLI only sees sessions it created locally. Add `--all` to also re-adopt any such orphan by endpoint and stop it, so no billing leaks:
+
+```bash
+./stop.sh --all
+```
+
+`--all` is opt-in: without it, `stop.sh` only stops the named session and never touches unknown ones.
+
 ---
 
 ## Quant tiers and measured benchmarks
@@ -175,3 +185,4 @@ Reference Maya server JSON configs for all three tiers are included in [`configs
 3. **SSH key type:** Colab accepts `ed25519` / `ecdsa` and rejects RSA keys. The scripts manage a dedicated `~/.ssh/id_ed25519_colab`.
 4. **Non-interactive `colab ssh` omits `/usr/local/cuda/bin` from `PATH`** — `start.sh` exports it explicitly.
 5. **The 236 GB `/content` disk is ephemeral:** `colab stop` deletes the VM and local model weights (and switching tiers in `start.sh` clears other cached `MikeRoz-*` folders first so 150+ GB downloads fit).
+6. **Orphan sessions are invisible to `colab stop`:** the CLI only tracks sessions it created locally (stored in `~/.config/colab-cli/sessions.json`). A session made via the web dashboard or another machine shows as `[?]` in `colab sessions` and can't be stopped by name — so it keeps billing until killed. `./stop.sh --all` re-adopts any such orphan by endpoint and stops it (opt-in, to avoid killing sessions you didn't start).
