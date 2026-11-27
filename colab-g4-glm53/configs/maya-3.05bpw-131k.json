@@ -6,6 +6,11 @@
   "model_name": "glm-5.3-flash-uncensored-3.05bpw",
   "host": "127.0.0.1",
   "port": 8090,
+  "api_key": "REPLACE_WITH_RANDOM_BEARER_TOKEN",
+  "cors_origins": [
+    "http://127.0.0.1:18100",
+    "http://localhost:18100"
+  ],
   "max_context": 131072,
   "args": [
     "--glm-pack", "/content/models/MikeRoz-3.05bpw-uncensored/pack",

@@ -116,14 +116,14 @@ Once `tunnel.sh` reports `200 OK` on `http://127.0.0.1:18100/v1/models`:
 - **OpenAI Base URL:** `http://127.0.0.1:18100/v1`
 - **Anthropic Base URL:** `http://127.0.0.1:18100` (`/v1/messages` with `thinking` and tool calls)
 - **Web UI + Maya monitor:** `http://127.0.0.1:18100/`
-- **API Key:** any non-empty string, e.g. `sk-local`
+- **API Key:** per-session random 256-bit Bearer token stored at `~/.local/state/colab-g4-glm53/session-glm53.token` (`chmod 600`; override with `MAYA_API_KEY=...` or disable with `--no-auth`)
 - **Model Name:** `glm-5.3-flash-uncensored-2.51bpw` (or `3.05bpw` / `4.05bpw`; Maya accepts any model string)
 
 ### OpenAI SDK / OpenCode / Codex / OMP
 
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:18100/v1"
-export OPENAI_API_KEY="sk-local"
+export OPENAI_API_KEY="$(cat ~/.local/state/colab-g4-glm53/session-glm53.token)"
 export OPENAI_MODEL="glm-5.3-flash-uncensored-2.51bpw"
 ```
 
@@ -131,7 +131,7 @@ export OPENAI_MODEL="glm-5.3-flash-uncensored-2.51bpw"
 
 ```bash
 ANTHROPIC_BASE_URL="http://127.0.0.1:18100" \
-ANTHROPIC_AUTH_TOKEN="sk-local" \
+ANTHROPIC_AUTH_TOKEN="$(cat ~/.local/state/colab-g4-glm53/session-glm53.token)" \
 ANTHROPIC_MODEL="glm-5.3-flash-uncensored-2.51bpw" \
 claude
 ```
@@ -139,7 +139,7 @@ claude
 ### Quick health check
 
 ```bash
-curl -s http://127.0.0.1:18100/v1/models
+curl -s -H "Authorization: Bearer $(cat ~/.local/state/colab-g4-glm53/session-glm53.token)" http://127.0.0.1:18100/v1/models
 ```
 
 Reference Maya server JSON configs for all three tiers are included in [`configs/`](configs/).

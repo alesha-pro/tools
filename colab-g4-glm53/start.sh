@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# One-command launcher: provisions Google Colab G4 (RTX PRO 6000 Blackwell 96 GB),
-# builds Project Maya for sm_120, downloads & packs an abliterated GLM-5.3-Flash EXL3 quant
-# + DFlash2 drafter, starts the tuned OpenAI/Anthropic server on remote :8090,
-# and opens an SSH port-forward tunnel to http://127.0.0.1:<PORT>/v1.
+# Hardened one-command launcher: provisions Google Colab G4 (RTX PRO 6000 Blackwell 96 GB),
+# builds pinned Project Maya (v1.1.74 by default) for sm_120, downloads & verifies weights,
+# starts an authenticated OpenAI/Anthropic server bound to remote 127.0.0.1:8090,
+# and opens an isolated SSH port-forward tunnel to http://127.0.0.1:<PORT>/v1.
 #
 # Usage:
-#   ./start.sh [2.51|3.05|4.05] [--ctx 131072|262144] [--port 18100] [--session glm53] [--bg] [--no-wait]
+#   ./start.sh [2.51|3.05|4.05] [--ctx 131072|262144] [--port 18100] [--session glm53]
+#              [--maya-ref v1.1.74] [--hf-revision main] [--no-auth] [--bg] [--no-wait]
 #
 # Examples:
 #   ./start.sh                 # Default: 2.51bpw (~102 tok/s), 131K ctx, localhost:18100
@@ -13,10 +14,12 @@
 #   ./start.sh 4.05            # Q4-level quality (~72 tok/s), 131K ctx
 #   ./start.sh 2.51 --ctx 262144 --bg
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COLAB_BIN="${COLAB_BIN:-$HOME/.local/bin/colab}"
 KEY="${COLAB_SSH_KEY:-$HOME/.ssh/id_ed25519_colab}"
+STATE_DIR="${COLAB_STATE_DIR:-$HOME/.local/state/colab-g4-glm53}"
 
 TIER="2.51"
 CTX="131072"
@@ -24,6 +27,11 @@ LOCAL_PORT="18100"
 SESSION="glm53"
 TUNNEL_MODE="fg"
 WAIT_FOR_GPU="1"
+MAYA_REF="${MAYA_REF:-v1.1.74}"
+HF_REVISION="${HF_REVISION:-main}"
+DFLASH_REVISION="${DFLASH_REVISION:-f3569acb7f9cee95e66d24442d75536eb00ab842}"
+DFLASH_SHA256="${DFLASH_SHA256:-}"
+AUTH_MODE="${COLAB_AUTH_MODE:-token}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,14 +40,23 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "Missing value for --ctx" >&2; exit 1; }
       CTX="$2"; shift 2
       ;;
-    --port)
-      [ $# -ge 2 ] || { echo "Missing value for --port" >&2; exit 1; }
+    --port|-p)
+      [ $# -ge 2 ] || { echo "Missing value for $1" >&2; exit 1; }
       LOCAL_PORT="$2"; shift 2
       ;;
     --session|-s)
       [ $# -ge 2 ] || { echo "Missing value for $1" >&2; exit 1; }
       SESSION="$2"; shift 2
       ;;
+    --maya-ref)
+      [ $# -ge 2 ] || { echo "Missing value for --maya-ref" >&2; exit 1; }
+      MAYA_REF="$2"; shift 2
+      ;;
+    --hf-revision)
+      [ $# -ge 2 ] || { echo "Missing value for --hf-revision" >&2; exit 1; }
+      HF_REVISION="$2"; shift 2
+      ;;
+    --no-auth)      AUTH_MODE="none"; shift ;;
     --bg)           TUNNEL_MODE="--bg"; shift ;;
     --no-wait)      WAIT_FOR_GPU="0"; shift ;;
     -h|--help)
@@ -50,11 +67,92 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if ! command -v "$COLAB_BIN" >/dev/null 2>&1 && [ ! -x "$COLAB_BIN" ]; then
+validate_inputs() {
+  if [[ ! "$SESSION" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]]; then
+    echo "[start] Error: invalid session name '$SESSION' (use alphanumeric, '.', '_', '-', max 64 chars)." >&2
+    exit 1
+  fi
+  if [[ ! "$LOCAL_PORT" =~ ^[0-9]+$ ]] || [ "$LOCAL_PORT" -lt 1024 ] || [ "$LOCAL_PORT" -gt 65535 ]; then
+    echo "[start] Error: invalid --port '$LOCAL_PORT' (expected integer 1024..65535)." >&2
+    exit 1
+  fi
+  if [[ ! "$CTX" =~ ^[0-9]+$ ]] || [ "$CTX" -lt 4096 ] || [ "$CTX" -gt 1048576 ]; then
+    echo "[start] Error: invalid --ctx '$CTX' (expected integer 4096..1048576)." >&2
+    exit 1
+  fi
+  for ref_name in MAYA_REF HF_REVISION DFLASH_REVISION; do
+    local val="${!ref_name}"
+    if [[ ! "$val" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$ ]] || [[ "$val" == *..* ]]; then
+      echo "[start] Error: unsafe git/HF ref in ${ref_name}: '$val'." >&2
+      exit 1
+    fi
+  done
+  if [ -n "$DFLASH_SHA256" ] && [[ ! "$DFLASH_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "[start] Error: DFLASH_SHA256 must be a 64-character hex SHA-256 digest." >&2
+    exit 1
+  fi
+  if [[ "$AUTH_MODE" != "token" && "$AUTH_MODE" != "none" ]]; then
+    echo "[start] Error: invalid COLAB_AUTH_MODE '$AUTH_MODE' (expected 'token' or 'none')." >&2
+    exit 1
+  fi
+  if [[ "$KEY" == *$'\n'* ]] || [[ "$COLAB_BIN" == *$'\n'* ]]; then
+    echo "[start] Error: newline characters are not permitted in paths." >&2
+    exit 1
+  fi
+}
+
+ensure_state_dir() {
+  mkdir -p "$(dirname "$STATE_DIR")"
+  if [ -L "$STATE_DIR" ]; then
+    echo "[start] Security error: STATE_DIR '$STATE_DIR' must not be a symlink." >&2
+    exit 1
+  fi
+  mkdir -p -m 700 "$STATE_DIR"
+  if [ ! -d "$STATE_DIR" ] || [ ! -O "$STATE_DIR" ]; then
+    echo "[start] Security error: STATE_DIR '$STATE_DIR' is not owned by the current user." >&2
+    exit 1
+  fi
+  chmod 700 "$STATE_DIR"
+}
+
+assert_safe_file() {
+  local f="$1"
+  if [ -L "$f" ]; then
+    echo "[start] Security error: refusing to use symlink '$f'." >&2
+    exit 1
+  fi
+  if [ -e "$f" ] && [ ! -O "$f" ]; then
+    echo "[start] Security error: '$f' is not owned by the current user." >&2
+    exit 1
+  fi
+}
+
+ssh_proxy_quote() {
+  local s="$1"
+  s="${s//%/%%}"
+  s="${s//\'/\'\\\'\'}"
+  printf "'%s'" "$s"
+}
+
+validate_inputs
+ensure_state_dir
+
+if command -v "$COLAB_BIN" >/dev/null 2>&1; then
+  COLAB_BIN_RESOLVED="$(command -v "$COLAB_BIN")"
+elif [ -x "$COLAB_BIN" ]; then
+  COLAB_BIN_RESOLVED="$COLAB_BIN"
+else
   echo "[start] Error: colab CLI not found at '$COLAB_BIN'." >&2
   echo "[start] Install google-colab-cli or set COLAB_BIN=/path/to/colab." >&2
   exit 1
 fi
+
+for req_bin in ssh ssh-keygen curl python3; do
+  if ! command -v "$req_bin" >/dev/null 2>&1; then
+    echo "[start] Error: required command '$req_bin' not found in PATH." >&2
+    exit 1
+  fi
+done
 
 case "$TIER" in
   2.51)
@@ -75,6 +173,10 @@ case "$TIER" in
 esac
 
 MODEL_NAME="glm-5.3-flash-uncensored-${TIER}bpw"
+TOKEN_FILE="${STATE_DIR}/session-${SESSION}.token"
+KNOWN_HOSTS_FILE="${STATE_DIR}/known_hosts.${SESSION}"
+ENDPOINT_FILE="${STATE_DIR}/session-${SESSION}.endpoint"
+METAFILE="${STATE_DIR}/tunnel-${SESSION}-${LOCAL_PORT}.env"
 
 LOCAL_IS_TTY=0
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -97,11 +199,81 @@ else
   C_YELLOW=""
 fi
 
-if [ ! -f "$KEY" ]; then
-  printf '%s[start]%s Generating ed25519 SSH key for Colab at %s ...\n' "$C_CYAN" "$C_RESET" "$KEY"
-  mkdir -p "$(dirname "$KEY")"
-  ssh-keygen -t ed25519 -N "" -C "colab-cli" -f "$KEY"
-fi
+ensure_ssh_key() {
+  local key_dir
+  key_dir="$(dirname "$KEY")"
+  if [ -L "$key_dir" ] || [ -L "$KEY" ] || [ -L "${KEY}.pub" ]; then
+    echo "[start] Security error: SSH key path '$KEY' (or its parent) must not be a symlink." >&2
+    exit 1
+  fi
+  if [ ! -d "$key_dir" ]; then
+    mkdir -p -m 700 "$key_dir"
+  elif [ -O "$key_dir" ] && [ "$(basename "$key_dir")" = ".ssh" ]; then
+    chmod 700 "$key_dir" 2>/dev/null || true
+  fi
+  if [ ! -f "$KEY" ]; then
+    printf '%s[start]%s Generating dedicated ed25519 SSH key for Colab at %s ...\n' "$C_CYAN" "$C_RESET" "$KEY"
+    ssh-keygen -t ed25519 -N "" -C "colab-cli" -f "$KEY"
+  fi
+  assert_safe_file "$KEY"
+  chmod 600 "$KEY"
+  if [ -f "${KEY}.pub" ]; then
+    assert_safe_file "${KEY}.pub"
+    chmod 644 "${KEY}.pub"
+  fi
+}
+
+ensure_api_token() {
+  local force_rotate="${1:-0}"
+  if [ "$AUTH_MODE" = "none" ]; then
+    API_KEY=""
+    rm -f "$TOKEN_FILE"
+    return 0
+  fi
+  assert_safe_file "$TOKEN_FILE"
+  if [ -n "${MAYA_API_KEY:-}" ]; then
+    if [[ ! "$MAYA_API_KEY" =~ ^[a-zA-Z0-9._-]{16,256}$ ]]; then
+      echo "[start] Error: MAYA_API_KEY must be 16..256 chars of [a-zA-Z0-9._-]." >&2
+      exit 1
+    fi
+    API_KEY="$MAYA_API_KEY"
+  elif [ "$force_rotate" -eq 0 ] && [ -s "$TOKEN_FILE" ]; then
+    API_KEY="$(tr -d '\r\n' < "$TOKEN_FILE")"
+    if [[ ! "$API_KEY" =~ ^[a-zA-Z0-9._-]{16,256}$ ]]; then
+      API_KEY=""
+    fi
+  else
+    API_KEY=""
+  fi
+  if [ -z "$API_KEY" ]; then
+    API_KEY="$(python3 -c 'import secrets; print("sk-maya-" + secrets.token_hex(24))')"
+  fi
+  local tmp_tok
+  tmp_tok="$(mktemp "${STATE_DIR}/.tok.${SESSION}.XXXXXX")"
+  printf '%s\n' "$API_KEY" > "$tmp_tok"
+  chmod 600 "$tmp_tok"
+  mv -f "$tmp_tok" "$TOKEN_FILE"
+}
+
+sync_known_hosts_for_endpoint() {
+  local status_text="$1" current_ep="" prev_ep=""
+  # Extract endpoint token from `[session] <endpoint> | Hardware: ...`
+  if [[ "$status_text" =~ ^\[[^]]+\][[:space:]]+([^[:space:]|]+) ]]; then
+    current_ep="${BASH_REMATCH[1]}"
+  fi
+  assert_safe_file "$KNOWN_HOSTS_FILE"
+  assert_safe_file "$ENDPOINT_FILE"
+  if [ -f "$ENDPOINT_FILE" ]; then
+    prev_ep="$(tr -d '\r\n' < "$ENDPOINT_FILE" 2>/dev/null || true)"
+  fi
+  if [ -n "$current_ep" ] && [ "$current_ep" != "$prev_ep" ]; then
+    rm -f "$KNOWN_HOSTS_FILE"
+    printf '%s\n' "$current_ep" > "$ENDPOINT_FILE"
+    chmod 600 "$ENDPOINT_FILE"
+  fi
+}
+
+ensure_ssh_key
 
 # Prevent macOS idle sleep while provisioning & tunneling (automatically exits when $$ exits)
 if [ "$(uname -s)" = "Darwin" ] && command -v caffeinate >/dev/null 2>&1; then
@@ -110,14 +282,16 @@ fi
 
 printf '\n'
 printf '%s╭──────────────────────────────────────────────────────────────────────╮%s\n' "$C_CYAN" "$C_RESET"
-printf '%s│%s  %sGLM-5.3-Flash Uncensored · Colab G4 Launcher%s                        %s│%s\n' \
+printf '%s│%s  %sGLM-5.3-Flash Uncensored · Colab G4 Launcher (Hardened)%s             %s│%s\n' \
   "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_CYAN" "$C_RESET"
 printf '%s╰──────────────────────────────────────────────────────────────────────╯%s\n' "$C_CYAN" "$C_RESET"
 printf '  %s%-12s%s %s%s%s\n' "$C_DIM" "Session" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET"
 printf '  %s%-12s%s %s\n' "$C_DIM" "GPU" "$C_RESET" "Colab G4 (RTX PRO 6000 Blackwell 96 GB)"
 printf '  %s%-12s%s %s%s bpw%s\n' "$C_DIM" "Quant" "$C_RESET" "$C_CYAN" "$TIER" "$C_RESET"
 printf '  %s%-12s%s %s\n' "$C_DIM" "Context" "$C_RESET" "$CTX"
-printf '  %s%-12s%s %s\n' "$C_DIM" "Local Port" "$C_RESET" "$LOCAL_PORT"
+printf '  %s%-12s%s %s\n' "$C_DIM" "Maya Ref" "$C_RESET" "$MAYA_REF"
+printf '  %s%-12s%s %s\n' "$C_DIM" "Local Port" "$C_RESET" "127.0.0.1:${LOCAL_PORT}"
+printf '  %s%-12s%s %s\n' "$C_DIM" "API Auth" "$C_RESET" "$([ "$AUTH_MODE" = "token" ] && echo "Bearer token (0600)" || echo "disabled (--no-auth)")"
 
 sleep_with_countdown() {
   local secs="$1"
@@ -142,6 +316,7 @@ sleep_with_countdown() {
   fi
 }
 
+SESSION_NEWLY_CREATED=0
 create_g4_session() {
   local attempt=1
   local base_delays=(30 45 60 90 120)
@@ -156,21 +331,23 @@ create_g4_session() {
     local out rc=0
     # NOTE: Never pass --high-mem for G4; G4 already allocates the full 176 GiB RAM / 48 vCPU shape.
     # Disable colab-cli's internal 4x retry burst so we control rate-limit-safe spacing ourselves.
-    out="$(COLAB_CLI_ASSIGN_RETRIES=0 "$COLAB_BIN" new -s "$SESSION" --gpu G4 2>&1)" || rc=$?
+    out="$(COLAB_CLI_ASSIGN_RETRIES=0 "$COLAB_BIN_RESOLVED" new -s "$SESSION" --gpu G4 2>&1)" || rc=$?
 
     if [ "$rc" -eq 0 ] && ! grep -qiE "Error:|Traceback|Service Unavailable|Allocation refused|Backend rejected" <<<"$out"; then
+      assert_safe_file "$KNOWN_HOSTS_FILE"
+      assert_safe_file "$ENDPOINT_FILE"
+      rm -f "$KNOWN_HOSTS_FILE" "$ENDPOINT_FILE"
+      SESSION_NEWLY_CREATED=1
       printf '  %s✓%s Colab G4 session %s%s%s allocated (attempt #%s)\n' \
         "$C_GREEN" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET" "$attempt"
       return 0
     fi
 
-    # Strip Rich traceback box lines (e.g. `│ 170 │ except TooManyAssignmentsError:`)
-    # and unwrap hard-wrapped lines so we only inspect the actual error message.
+    # Strip Rich traceback box lines and unwrap hard-wrapped lines so we only inspect the actual error message.
     local clean_err
     clean_err="$(printf '%s\n' "$out" | sed -E '/^[╭│╰]/d' | tr '\n' ' ' | tr -s ' ')"
 
     # Hard stops: quota, too many sessions (412), rate-limit (429), auth (401/403), invalid tier (400).
-    # Never retry these so we don't hit Colab API rate limits or account locks.
     if grep -qiE "Allocation refused|precondition failed|Backend rejected|TooManyAssignmentsError|Too Many Requests|Unauthorized|Forbidden|not entitled|no quota|insufficient|invalid_grant|token.*expired|HTTP[^0-9]*(401|403|429)" <<<"$clean_err"; then
       printf '\n  %s✗%s Colab rejected allocation (hard stop, not retrying):\n' "$C_YELLOW" "$C_RESET" >&2
       printf '%s\n' "$out" >&2
@@ -193,7 +370,6 @@ create_g4_session() {
           idx=$((${#base_delays[@]} - 1))
         fi
         delay="${base_delays[$idx]}"
-        # Add small +/-4s jitter when waiting >=30s so polling never looks robotic
         if [ "$delay" -ge 30 ]; then
           local jitter=$(( (RANDOM % 9) - 4 ))
           delay=$((delay + jitter))
@@ -216,34 +392,48 @@ create_g4_session() {
 }
 
 session_rc=0
-session_check="$("$COLAB_BIN" status -s "$SESSION" 2>&1)" || session_rc=$?
+session_check="$("$COLAB_BIN_RESOLVED" status -s "$SESSION" 2>&1)" || session_rc=$?
 if [ "$session_rc" -ne 0 ] || grep -qiE "not found|no active sessions|does not exist" <<<"$session_check"; then
   create_g4_session
 fi
 
 printf '\n'
-if status_out="$("$COLAB_BIN" status -s "$SESSION" 2>&1)"; then
+if status_out="$("$COLAB_BIN_RESOLVED" status -s "$SESSION" 2>&1)"; then
+  sync_known_hosts_for_endpoint "$status_out"
   while IFS= read -r line; do
     [ -n "$line" ] && printf '  %s%s%s\n' "$C_DIM" "$line" "$C_RESET"
   done <<< "$status_out"
 fi
-if usage_out="$("$COLAB_BIN" usage 2>&1)"; then
+if usage_out="$("$COLAB_BIN_RESOLVED" usage 2>&1)"; then
   while IFS= read -r line; do
     [ -n "$line" ] && printf '  %s%s%s\n' "$C_DIM" "$line" "$C_RESET"
   done <<< "$usage_out"
 fi
 
-REMOTE_SCRIPT_FILE="$(mktemp)"
+API_KEY=""
+ensure_api_token "$SESSION_NEWLY_CREATED"
+
+REMOTE_SCRIPT_FILE="$(mktemp "${STATE_DIR}/.remote-provision.${SESSION}.XXXXXX")"
+chmod 600 "$REMOTE_SCRIPT_FILE"
 trap 'rm -f "$REMOTE_SCRIPT_FILE"' EXIT
 
-cat > "$REMOTE_SCRIPT_FILE" <<'REMOTE_EOF'
+# Embed API_KEY via stdin script assignment (0600 file) so it never appears in local or remote `ps aux` argv.
+printf 'MAYA_REMOTE_API_KEY=%q\n' "$API_KEY" > "$REMOTE_SCRIPT_FILE"
+
+cat >> "$REMOTE_SCRIPT_FILE" <<'REMOTE_EOF'
 set -euo pipefail
+umask 077
 HF_REPO="$1"
 MODEL_DIR="$2"
 CTX="$3"
 SPEC_MIN_P="$4"
 TIER="$5"
 IS_TTY="${6:-0}"
+MAYA_REF="$7"
+HF_REVISION="$8"
+DFLASH_REVISION="$9"
+DFLASH_SHA256="${10:-}"
+LOCAL_PORT="${11:-18100}"
 [ -n "${NO_COLOR:-}" ] && IS_TTY=0
 
 if [ "$IS_TTY" -eq 1 ]; then
@@ -346,13 +536,26 @@ else
   step_ok "Dependencies ready in $(fmt_duration "$LAST_DURATION")"
 fi
 
-step_header 2 "Building Project Maya (CUDA sm_120)"
+step_header 2 "Building Project Maya (${MAYA_REF}, CUDA sm_120)"
 cd /content
-if [ ! -f /content/project-maya/CMakeLists.txt ]; then
+MAYA_REF_MARKER="/content/project-maya/.maya_ref_ok"
+if [ -f "$MAYA_REF_MARKER" ] && [ "$(cat "$MAYA_REF_MARKER" 2>/dev/null || true)" != "$MAYA_REF" ]; then
   rm -rf /content/project-maya
-  run_with_spinner "Cloning Project Maya..." /content/maya-build.log \
-    git clone --depth 1 https://github.com/mw00/project-maya.git /content/project-maya || \
-    fail_with_log "Failed to clone Project Maya." /content/maya-build.log 50
+fi
+
+checkout_maya() {
+  rm -rf /content/project-maya
+  mkdir -p /content/project-maya
+  git -C /content/project-maya init -q
+  git -C /content/project-maya remote add origin https://github.com/mw00/project-maya.git
+  git -C /content/project-maya fetch --depth 1 origin "$MAYA_REF"
+  git -C /content/project-maya checkout -q --detach FETCH_HEAD
+  printf '%s\n' "$MAYA_REF" > "$MAYA_REF_MARKER"
+}
+
+if [ ! -f /content/project-maya/CMakeLists.txt ] || [ ! -f "$MAYA_REF_MARKER" ]; then
+  run_with_spinner "Fetching Project Maya (${MAYA_REF})..." /content/maya-build.log checkout_maya || \
+    fail_with_log "Failed to fetch Project Maya (${MAYA_REF})." /content/maya-build.log 50
 fi
 cd /content/project-maya
 
@@ -371,7 +574,7 @@ build_maya() {
 }
 
 if [ -x /content/project-maya/build/maya ]; then
-  step_ok "Cached"
+  step_ok "Cached (${MAYA_REF})"
 else
   run_with_spinner "Building Maya (CUDA sm_120)..." /content/maya-build.log build_maya || \
     fail_with_log "Project Maya build failed." /content/maya-build.log 50
@@ -381,16 +584,45 @@ fi
 step_header 3 "Downloading DFlash2 drafter (665 MB) & ${HF_REPO}"
 mkdir -p /content/models/dflash2 "/content/models/${MODEL_DIR}"
 
+verify_dflash_file() {
+  python3 - "$1" "$DFLASH_SHA256" <<'PY'
+import hashlib, os, sys
+path, expected_sha = sys.argv[1], sys.argv[2].strip().lower()
+if not os.path.isfile(path) or os.path.islink(path):
+    sys.exit(1)
+size = os.path.getsize(path)
+if size < 600_000_000:
+    sys.stderr.write(f"DFlash2 GGUF too small ({size} bytes)\n")
+    sys.exit(1)
+with open(path, "rb") as f:
+    magic = f.read(4)
+    if magic != b"GGUF":
+        sys.stderr.write(f"Invalid GGUF header: {magic!r}\n")
+        sys.exit(1)
+    if expected_sha:
+        h = hashlib.sha256(magic)
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+        got = h.hexdigest()
+        if got != expected_sha:
+            sys.stderr.write(f"DFlash2 SHA-256 mismatch: expected {expected_sha}, got {got}\n")
+            sys.exit(1)
+PY
+}
+
 need_dflash=0
 need_model=0
-[ ! -f /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf ] && need_dflash=1
+if ! verify_dflash_file /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf 2>/dev/null; then
+  need_dflash=1
+fi
 [ ! -f "/content/models/${MODEL_DIR}/pack/.packed_ok" ] && need_model=1
 
 download_dflash() {
   local tmp="/content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf.tmp"
   rm -f "$tmp"
-  curl -fSL -o "$tmp" \
-    "https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF/resolve/f3569acb7f9cee95e66d24442d75536eb00ab842/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf"
+  curl --proto '=https' --tlsv1.2 -fSL --retry 3 -o "$tmp" \
+    "https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF/resolve/${DFLASH_REVISION}/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf"
+  verify_dflash_file "$tmp"
   mv -f "$tmp" /content/models/dflash2/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf
 }
 
@@ -398,30 +630,43 @@ if [ "$need_dflash" -eq 0 ] && [ "$need_model" -eq 0 ]; then
   step_ok "Cached"
 else
   if [ "$need_dflash" -eq 1 ]; then
-    run_with_spinner "Downloading DFlash2 drafter (665 MB)..." /content/maya-dflash.log download_dflash || \
-      fail_with_log "Failed to download DFlash2 drafter." /content/maya-dflash.log 50
-    step_ok "DFlash2 drafter downloaded in $(fmt_duration "$LAST_DURATION")"
+    run_with_spinner "Downloading & verifying DFlash2 drafter (665 MB)..." /content/maya-dflash.log download_dflash || \
+      fail_with_log "Failed to download or verify DFlash2 drafter." /content/maya-dflash.log 50
+    step_ok "DFlash2 drafter verified in $(fmt_duration "$LAST_DURATION")"
   else
-    step_ok "DFlash2 drafter cached"
+    step_ok "DFlash2 drafter cached & verified"
   fi
 
   if [ "$need_model" -eq 1 ]; then
     # Clean other model folders when switching tiers on Colab's ephemeral 236 GB disk
     for d in /content/models/MikeRoz-*; do
-      [ -d "$d" ] && [ "$(basename "$d")" != "$MODEL_DIR" ] && rm -rf "$d"
+      [ -d "$d" ] && [ ! -L "$d" ] && [ "$(basename "$d")" != "$MODEL_DIR" ] && rm -rf "$d"
     done
     dl_t0=$SECONDS
-    printf '  %s▸%s Downloading %s -> /content/models/%s\n' "$C_CYAN" "$C_RESET" "$HF_REPO" "$MODEL_DIR"
-    env HF_XET_HIGH_PERFORMANCE=1 python3 - "$HF_REPO" "/content/models/${MODEL_DIR}" "$IS_TTY" <<'PY'
-import inspect, os, sys
+    printf '  %s▸%s Downloading %s (rev: %s) -> /content/models/%s\n' \
+      "$C_CYAN" "$C_RESET" "$HF_REPO" "$HF_REVISION" "$MODEL_DIR"
+    env HF_XET_HIGH_PERFORMANCE=1 python3 - "$HF_REPO" "/content/models/${MODEL_DIR}" "$IS_TTY" "$HF_REVISION" <<'PY'
+import glob, inspect, os, sys
 
-repo, dst, is_tty = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+repo, dst, is_tty, rev = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
 if not is_tty:
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 from huggingface_hub import snapshot_download
 
-kwargs = {"repo_id": repo, "local_dir": dst, "max_workers": 8}
+# Block unsafe pickle/executable formats from community model repositories
+unsafe_patterns = [
+    "*.pt", "*.pth", "*.bin", "*.pkl", "*.pickle", "*.ckpt",
+    "*.so", "*.dll", "*.exe", "*.bat", "*.cmd", "*.sh",
+]
+
+kwargs = {
+    "repo_id": repo,
+    "revision": rev,
+    "local_dir": dst,
+    "max_workers": 8,
+    "ignore_patterns": unsafe_patterns,
+}
 if is_tty:
     try:
         from huggingface_hub.utils import tqdm as hf_tqdm
@@ -438,8 +683,12 @@ if is_tty:
         pass
 
 snapshot_download(**kwargs)
+
+safetensors = glob.glob(os.path.join(dst, "**", "*.safetensors"), recursive=True)
+if not safetensors:
+    raise RuntimeError(f"No .safetensors weight files found in {dst}")
 PY
-    step_ok "Model weights downloaded in $(fmt_duration "$((SECONDS - dl_t0))")"
+    step_ok "Model weights downloaded & checked in $(fmt_duration "$((SECONDS - dl_t0))")"
   fi
 fi
 
@@ -455,10 +704,18 @@ else
   step_ok "Packed in $(fmt_duration "$LAST_DURATION")"
 fi
 
-step_header 5 "Writing Maya server config"
-python3 - "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" <<'PY'
-import sys, json
-model_dir, ctx, spec_p, tier = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+step_header 5 "Writing hardened Maya server config"
+MAYA_REMOTE_API_KEY="$MAYA_REMOTE_API_KEY" python3 - "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" "$LOCAL_PORT" <<'PY'
+import json, os, sys
+
+model_dir, ctx, spec_p, tier, local_port = (
+    sys.argv[1],
+    int(sys.argv[2]),
+    sys.argv[3],
+    sys.argv[4],
+    int(sys.argv[5]),
+)
+api_key = os.environ.get("MAYA_REMOTE_API_KEY", "")
 pack = f"/content/models/{model_dir}/pack"
 
 args = [
@@ -472,7 +729,6 @@ args = [
 if ctx <= 131072:
     args += ["--kv", "k8v4"]
 else:
-    # k8v4 cannot be combined with --kv-resident; use int8 KV streaming for 262K+
     args += ["--kv", "int8", "--kv-resident", "20480"]
 
 cfg = {
@@ -483,6 +739,10 @@ cfg = {
     "model_name": f"glm-5.3-flash-uncensored-{tier}bpw",
     "host": "127.0.0.1",
     "port": 8090,
+    "cors_origins": [
+        f"http://127.0.0.1:{local_port}",
+        f"http://localhost:{local_port}",
+    ],
     "max_context": ctx,
     "args": args,
     "env": {
@@ -494,19 +754,32 @@ cfg = {
         "MAYA_GLM_DSA_GRAPHS": "1",
     },
 }
-with open("/content/maya-glm53.json", "w") as f:
+if api_key:
+    cfg["api_key"] = api_key
+
+cfg_path = "/content/maya-glm53.json"
+fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
     json.dump(cfg, f, indent=2)
+os.chmod(cfg_path, 0o600)
 PY
 if [ "$CTX" -le 131072 ]; then
   KV_DESC="k8v4"
 else
   KV_DESC="int8 (kv_resident=20480)"
 fi
-step_ok "Config ready: ${KV_DESC}, DFlash2, spec_min_p=${SPEC_MIN_P}, CPU_LANE=18, DSA_GRAPHS=1"
+step_ok "Config ready (0600): ${KV_DESC}, DFlash2, spec_min_p=${SPEC_MIN_P}, loopback+CORS locked"
 
 step_header 6 "Loading GLM-5.3-Flash (${TIER} bpw) into 96 GB VRAM"
-pkill -f "serve/server.py" 2>/dev/null || true
-pkill -f "build/maya" 2>/dev/null || true
+if [ -f /content/maya-server.pid ]; then
+  old_pid="$(cat /content/maya-server.pid 2>/dev/null || true)"
+  if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+    kill "$old_pid" 2>/dev/null || true
+  fi
+  rm -f /content/maya-server.pid
+fi
+pkill -f "/content/project-maya/serve/server.py" 2>/dev/null || true
+pkill -f "/content/project-maya/build/maya" 2>/dev/null || true
 sleep 1
 
 nohup python3 /content/project-maya/serve/server.py \
@@ -516,6 +789,18 @@ nohup python3 /content/project-maya/serve/server.py \
   --port 8090 \
   > /content/maya-server.log 2>&1 < /dev/null &
 srv_pid=$!
+printf '%s\n' "$srv_pid" > /content/maya-server.pid
+chmod 600 /content/maya-server.pid /content/maya-server.log 2>/dev/null || true
+
+probe_remote_models() {
+  if [ -n "$MAYA_REMOTE_API_KEY" ]; then
+    curl -sf --config - http://127.0.0.1:8090/v1/models >/dev/null 2>&1 <<EOF
+header = "Authorization: Bearer ${MAYA_REMOTE_API_KEY}"
+EOF
+  else
+    curl -sf http://127.0.0.1:8090/v1/models >/dev/null 2>&1
+  fi
+}
 
 ready=0
 t0=$SECONDS
@@ -538,7 +823,7 @@ while true; do
   fi
   if [ "$last_probe" -lt 0 ] || [ $((elapsed - last_probe)) -ge 2 ]; then
     last_probe=$elapsed
-    if curl -sf http://127.0.0.1:8090/v1/models >/dev/null 2>&1; then
+    if probe_remote_models; then
       ready=1
       break
     fi
@@ -559,6 +844,7 @@ while true; do
 done
 
 cleanup_line
+unset MAYA_REMOTE_API_KEY
 if [ "$ready" -ne 1 ]; then
   fail_with_log "Maya server did not become ready within 540s." /content/maya-server.log 40
 fi
@@ -569,18 +855,29 @@ run_remote_provision() {
   local max_ssh_tries=4
   local ssh_try=1
   local ssh_bin="${SSH_BIN:-ssh}"
+  local proxy_cmd
+  proxy_cmd="$(ssh_proxy_quote "$COLAB_BIN_RESOLVED") ssh --proxy-mode -s $(ssh_proxy_quote "$SESSION") -i $(ssh_proxy_quote "$KEY")"
 
   while [ "$ssh_try" -le "$max_ssh_tries" ]; do
     local rc=0
-    "$ssh_bin" -i "$KEY" \
-      -o "ProxyCommand=${COLAB_BIN} ssh --proxy-mode -s ${SESSION} -i ${KEY}" \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
+    assert_safe_file "$KNOWN_HOSTS_FILE"
+    "$ssh_bin" \
+      -F /dev/null \
+      -i "$KEY" \
+      -o IdentitiesOnly=yes \
+      -o ForwardAgent=no \
+      -o ForwardX11=no \
+      -o PermitLocalCommand=no \
+      -o ClearAllForwardings=yes \
+      -o GatewayPorts=no \
+      -o "ProxyCommand=${proxy_cmd}" \
+      -o StrictHostKeyChecking=accept-new \
+      -o "UserKnownHostsFile=${KNOWN_HOSTS_FILE}" \
       -o ServerAliveInterval=20 \
       -o ServerAliveCountMax=6 \
       -o ConnectTimeout=25 \
       root@colab \
-      "bash -s -- $(printf '%q ' "$HF_REPO" "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" "$LOCAL_IS_TTY")" \
+      "bash -s -- $(printf '%q ' "$HF_REPO" "$MODEL_DIR" "$CTX" "$SPEC_MIN_P" "$TIER" "$LOCAL_IS_TTY" "$MAYA_REF" "$HF_REVISION" "$DFLASH_REVISION" "$DFLASH_SHA256" "$LOCAL_PORT")" \
       < "$REMOTE_SCRIPT_FILE" || rc=$?
 
     if [ "$rc" -eq 0 ]; then
@@ -593,7 +890,7 @@ run_remote_provision() {
 
     if [ "$ssh_try" -lt "$max_ssh_tries" ]; then
       local st_rc=0 st_out
-      st_out="$("$COLAB_BIN" status -s "$SESSION" 2>&1)" || st_rc=$?
+      st_out="$("$COLAB_BIN_RESOLVED" status -s "$SESSION" 2>&1)" || st_rc=$?
       if [ "$st_rc" -ne 0 ] || grep -qiE "not found|no active sessions|does not exist" <<<"$st_out"; then
         printf '\n  %s✗%s Colab session %s%s%s is no longer active.\n' \
           "$C_YELLOW" "$C_RESET" "$C_BOLD" "$SESSION" "$C_RESET" >&2
@@ -605,6 +902,7 @@ run_remote_provision() {
         fi
         return 1
       fi
+      sync_known_hosts_for_endpoint "$st_out"
 
       local wait_s=$((ssh_try * 5))
       printf '\n  %s▸%s SSH/WebSocket interrupted (rc=%s). Keep-alive reconnecting (%s/%s) in %ss...\n' \
@@ -624,14 +922,19 @@ run_remote_provision() {
 run_remote_provision
 rm -f "$REMOTE_SCRIPT_FILE"
 
-METAFILE="/tmp/colab-tunnel-${SESSION}-${LOCAL_PORT}.env"
-cat > "$METAFILE" <<EOF
-MODEL_TIER="${TIER}"
-MODEL_CTX="${CTX}"
-MODEL_NAME="${MODEL_NAME}"
+assert_safe_file "$METAFILE"
+META_TMP="$(mktemp "${STATE_DIR}/.meta.${SESSION}.${LOCAL_PORT}.XXXXXX")"
+cat > "$META_TMP" <<EOF
+MODEL_TIER=${TIER}
+MODEL_CTX=${CTX}
+MODEL_NAME=${MODEL_NAME}
+AUTH_MODE=${AUTH_MODE}
 EOF
+chmod 600 "$META_TMP"
+mv -f "$META_TMP" "$METAFILE"
 
 export MODEL_TIER="$TIER"
 export MODEL_CTX="$CTX"
 export MODEL_NAME="$MODEL_NAME"
+export COLAB_AUTH_MODE="$AUTH_MODE"
 exec "${SCRIPT_DIR}/tunnel.sh" "$SESSION" "$LOCAL_PORT" "$TUNNEL_MODE"
